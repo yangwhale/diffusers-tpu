@@ -419,7 +419,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
         attention_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
 
-        mark_sharding(hidden_states, P("dp"))
+        mark_sharding(hidden_states, P("dp", None, None, None, 'sp'))
         mark_sharding(encoder_hidden_states, P("dp"))
 
         if attention_kwargs is not None:

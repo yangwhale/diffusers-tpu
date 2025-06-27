@@ -75,7 +75,8 @@ WINDOW_SIZE = None
 
 PROFILE_OUT_PATH = "/tmp/tensorboard"
 
-USE_DP = True
+USE_DP = False
+USE_SP = False
 
 ####
 
@@ -134,16 +135,16 @@ r'blocks.\d+.ffn.net.2.weight': (None, axis), # (torch.Size([1536, 8960]), torch
 }
 
 text_encoder_shardings = {
-  'shared.weight': (axis, ), # (torch.Size([256384, 4096]), torch.bfloat16)
-  'encoder.block.*.layer.*.SelfAttention.q.weight': (axis, ), # (torch.Size([4096, 4096]), torch.bfloat16)
-  'encoder.block.*.layer.*.SelfAttention.k.weight': (axis, ), # (torch.Size([4096, 4096]), torch.bfloat16)
-  'encoder.block.*.layer.*.SelfAttention.v.weight': (axis, ), # (torch.Size([4096, 4096]), torch.bfloat16)
-  'encoder.block.*.layer.*.SelfAttention.o.weight': (None, axis), # (torch.Size([4096, 4096]), torch.bfloat16)
+  'shared.weight': ((axis,'dp','sp'), ), # (torch.Size([256384, 4096]), torch.bfloat16)
+  'encoder.block.*.layer.*.SelfAttention.q.weight': ((axis,'dp','sp'), ), # (torch.Size([4096, 4096]), torch.bfloat16)
+  'encoder.block.*.layer.*.SelfAttention.k.weight': ((axis,'dp','sp'), ), # (torch.Size([4096, 4096]), torch.bfloat16)
+  'encoder.block.*.layer.*.SelfAttention.v.weight': ((axis,'dp','sp'), ), # (torch.Size([4096, 4096]), torch.bfloat16)
+  'encoder.block.*.layer.*.SelfAttention.o.weight': (None, (axis,'dp','sp')), # (torch.Size([4096, 4096]), torch.bfloat16)
   # 'encoder.block.*.layer.*.SelfAttention.relative_attention_bias.weight': (), # (torch.Size([32, 64]), torch.bfloat16)
   # 'encoder.block.*.layer.*.layer_norm.weight': (), # (torch.Size([4096]), torch.bfloat16)
-  'encoder.block.*.layer.*.DenseReluDense.wi_0.weight': (axis, ), # (torch.Size([10240, 4096]), torch.bfloat16)
-  'encoder.block.*.layer.*.DenseReluDense.wi_1.weight': (axis, ), # (torch.Size([10240, 4096]), torch.bfloat16)
-  'encoder.block.*.layer.*.DenseReluDense.wo.weight': (None, axis), # (torch.Size([4096, 10240]), torch.bfloat16)
+  'encoder.block.*.layer.*.DenseReluDense.wi_0.weight': ((axis,'dp','sp'), ), # (torch.Size([10240, 4096]), torch.bfloat16)
+  'encoder.block.*.layer.*.DenseReluDense.wi_1.weight': ((axis,'dp','sp'), ), # (torch.Size([10240, 4096]), torch.bfloat16)
+  'encoder.block.*.layer.*.DenseReluDense.wo.weight': (None, (axis,'dp','sp')), # (torch.Size([4096, 10240]), torch.bfloat16)
   # 'encoder.final_layer_norm.weight': (), # (torch.Size([4096]), torch.bfloat16)
 }
 
@@ -317,17 +318,19 @@ def _tpu_splash_attention(query, key, value, env, scale=None, is_causal=False, w
     # Determine the partitioning spec based on the number of heads.
     if num_heads < mesh.size:
         # Replicated case for VAE. All devices get the full tensor.
-        partition_spec = P()
+        q_partition_spec = P()
+        kv_partition_spec = P()
     else:
         # Sharded case for Transformer. Split along the heads axis.
-        partition_spec = P('dp', 'axis', None, None)
+        q_partition_spec = P('dp', 'axis', 'sp', None)
+        kv_partition_spec = P('dp', 'axis', None, None)
 
     # ALWAYS use shard_map. The partition_spec will control the behavior.
     sharded_fn = shard_map(
         _attention_on_slices,
         mesh=mesh,
-        in_specs=(partition_spec, partition_spec, partition_spec),
-        out_specs=partition_spec,
+        in_specs=(q_partition_spec, kv_partition_spec, kv_partition_spec),
+        out_specs=q_partition_spec,
         check_rep=False,
     )
     return sharded_fn(query, key, value)
@@ -614,21 +617,21 @@ def main():
   env = torchax.default_env()
   # Create a 2D mesh for FSDP sharding
   
-  tp_dim, dp_dim = len(jax.devices()), 1
-  if USE_DP and tp_dim <= 8:
-     print("X"*30)
-     print("WARNING: DP will OOM in VAE on v6e-8. Need To Fix. Disable DP.")
-     print("X"*30)
-     USE_DP = False
-  elif USE_DP and tp_dim > 8:
+  tp_dim, dp_dim, sp_dim = len(jax.devices()), 1, 1
+  if USE_DP:
     # tp_dim > 8, which is v6e-16, could not divide head_dim=40, need use dp
-    print(f"{USE_DP=}, it need to use dp at v6e-16")
+    print(f"{USE_DP=}")
     tp_dim //= 2
     dp_dim = 2
-    USE_DP = True
+  
+  if USE_SP:
+    print(f"{USE_SP=}")
+    tp_dim //= 2
+    sp_dim = 2
+     
   # mesh = jax.make_mesh((len(jax.devices()), 1), (axis, 'fsdp'))
-  mesh_devices = mesh_utils.create_device_mesh((tp_dim, dp_dim), allow_split_physical_axes=True)
-  mesh = Mesh(mesh_devices, (axis,'dp'))
+  mesh_devices = mesh_utils.create_device_mesh((tp_dim, dp_dim, sp_dim), allow_split_physical_axes=True)
+  mesh = Mesh(mesh_devices, (axis,'dp','sp'))
 
   env.default_device_or_sharding = NamedSharding(mesh, P())
   env._mesh = mesh

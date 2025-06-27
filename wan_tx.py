@@ -61,6 +61,7 @@ NUM_STEP = 50
 PROFILE_OUT_PATH = "/dev/shm/tensorboard"
 
 USE_DP = True
+USE_SP = False
 
 
 ####
@@ -120,16 +121,16 @@ r'blocks.\d+.ffn.net.2.weight': (None, axis), # (torch.Size([1536, 8960]), torch
 }
 
 text_encoder_shardings = {
-  'shared.weight': (axis, ), # (torch.Size([256384, 4096]), torch.bfloat16)
-  'encoder.block.*.layer.*.SelfAttention.q.weight': (axis, ), # (torch.Size([4096, 4096]), torch.bfloat16)
-  'encoder.block.*.layer.*.SelfAttention.k.weight': (axis, ), # (torch.Size([4096, 4096]), torch.bfloat16)
-  'encoder.block.*.layer.*.SelfAttention.v.weight': (axis, ), # (torch.Size([4096, 4096]), torch.bfloat16)
-  'encoder.block.*.layer.*.SelfAttention.o.weight': (None, axis), # (torch.Size([4096, 4096]), torch.bfloat16)
+  'shared.weight': ((axis,'dp','sp'), ), # (torch.Size([256384, 4096]), torch.bfloat16)
+  'encoder.block.*.layer.*.SelfAttention.q.weight': ((axis,'dp','sp'), ), # (torch.Size([4096, 4096]), torch.bfloat16)
+  'encoder.block.*.layer.*.SelfAttention.k.weight': ((axis,'dp','sp'), ), # (torch.Size([4096, 4096]), torch.bfloat16)
+  'encoder.block.*.layer.*.SelfAttention.v.weight': ((axis,'dp','sp'), ), # (torch.Size([4096, 4096]), torch.bfloat16)
+  'encoder.block.*.layer.*.SelfAttention.o.weight': (None, (axis,'dp','sp')), # (torch.Size([4096, 4096]), torch.bfloat16)
   # 'encoder.block.*.layer.*.SelfAttention.relative_attention_bias.weight': (), # (torch.Size([32, 64]), torch.bfloat16)
   # 'encoder.block.*.layer.*.layer_norm.weight': (), # (torch.Size([4096]), torch.bfloat16)
-  'encoder.block.*.layer.*.DenseReluDense.wi_0.weight': (axis, ), # (torch.Size([10240, 4096]), torch.bfloat16)
-  'encoder.block.*.layer.*.DenseReluDense.wi_1.weight': (axis, ), # (torch.Size([10240, 4096]), torch.bfloat16)
-  'encoder.block.*.layer.*.DenseReluDense.wo.weight': (None, axis), # (torch.Size([4096, 10240]), torch.bfloat16)
+  'encoder.block.*.layer.*.DenseReluDense.wi_0.weight': ((axis,'dp','sp'), ), # (torch.Size([10240, 4096]), torch.bfloat16)
+  'encoder.block.*.layer.*.DenseReluDense.wi_1.weight': ((axis,'dp','sp'), ), # (torch.Size([10240, 4096]), torch.bfloat16)
+  'encoder.block.*.layer.*.DenseReluDense.wo.weight': (None, (axis,'dp','sp')), # (torch.Size([4096, 10240]), torch.bfloat16)
   # 'encoder.final_layer_norm.weight': (), # (torch.Size([4096]), torch.bfloat16)
 }
 
@@ -233,8 +234,6 @@ def _sdpa_reference(
   return attn_weight @ value
 
 def _tpu_flash_attention(query, key, value, env):
-  fsdp_partition = P('dp', axis, None, None)
-
   def wrap_flash_attention(query, key, value):
     block_sizes = flash_attention.BlockSizes(
         block_b=min(1, query.shape[0]),
@@ -277,8 +276,8 @@ def _tpu_flash_attention(query, key, value, env):
     wrap_flash_attention = shard_map(
         wrap_flash_attention,
         mesh=env._mesh,
-        in_specs=(fsdp_partition, fsdp_partition, fsdp_partition),
-        out_specs=fsdp_partition,
+        in_specs=(P('dp', axis, 'sp', None), P('dp', axis, None, None), P('dp', axis, None, None)),
+        out_specs=P('dp', axis, 'sp', None),
         check_rep=False,
     )
   # return flash_attn_mapped(query, key, value)
@@ -343,7 +342,7 @@ def main():
 
   torchax.enable_globally()
   env = torchax.default_env()
-  tp_dim, dp_dim = len(jax.devices()), 1
+  tp_dim, dp_dim, sp_dim = len(jax.devices()), 1, 1
   if tp_dim > 8:
     print("X"*30)
     print(f"tp_dim > 8, which is v6e-16, could not divide head_dim=40, need use dp. Enable it")
@@ -353,11 +352,16 @@ def main():
   if USE_DP:
     print(f"{USE_DP=}")
     tp_dim //= 2
-    dp_dim = 2    
+    dp_dim = 2
+  
+  if USE_SP:
+    print(f"{USE_SP=}")
+    tp_dim //= 2
+    sp_dim = 2
   
   # mesh = jax.make_mesh((tp_dim, dp_dim), (axis,'dp'))
-  mesh_devices = mesh_utils.create_device_mesh((tp_dim, dp_dim), allow_split_physical_axes=True)
-  mesh = Mesh(mesh_devices, (axis,'dp'))
+  mesh_devices = mesh_utils.create_device_mesh((tp_dim, dp_dim, sp_dim), allow_split_physical_axes=True)
+  mesh = Mesh(mesh_devices, (axis,'dp','sp'))
   env.default_device_or_sharding = NamedSharding(mesh, P())
 
   env._mesh = mesh
