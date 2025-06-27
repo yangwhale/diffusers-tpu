@@ -102,7 +102,8 @@ class WanRMS_norm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.0
 
     def forward(self, x):
-        return F.normalize(x, dim=(1 if self.channel_first else -1)) * self.scale * self.gamma + self.bias
+        res = F.normalize(x, dim=(1 if self.channel_first else -1)) * self.scale * self.gamma + self.bias
+        return res.to(x.dtype)
 
 
 class WanUpsample(nn.Upsample):
@@ -188,6 +189,7 @@ class WanResample(nn.Module):
                     x = x.reshape(b, c, t * 2, h, w)
         t = x.shape[2]
         x = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+        x = x.to(torch.bfloat16)
         x = self.resample(x)
         x = x.view(b, t, x.size(1), x.size(2), x.size(3)).permute(0, 2, 1, 3, 4)
 
@@ -311,6 +313,7 @@ class WanAttentionBlock(nn.Module):
 
         # apply attention
         x = F.scaled_dot_product_attention(q, k, v)
+        x = x.to(torch.bfloat16)
 
         x = x.squeeze(1).permute(0, 2, 1).reshape(batch_size * time, channels, height, width)
 

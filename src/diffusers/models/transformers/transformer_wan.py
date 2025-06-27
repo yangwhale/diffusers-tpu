@@ -33,6 +33,11 @@ from ..normalization import FP32LayerNorm
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
+import jax
+from torchax import interop
+from jax.sharding import PartitionSpec as P
+mark_sharding = interop.torch_view(jax.lax.with_sharding_constraint)
+
 
 class WanAttnProcessor2_0:
     def __init__(self):
@@ -413,6 +418,10 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
         return_dict: bool = True,
         attention_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+
+        mark_sharding(hidden_states, P("dp"))
+        mark_sharding(encoder_hidden_states, P("dp"))
+
         if attention_kwargs is not None:
             attention_kwargs = attention_kwargs.copy()
             lora_scale = attention_kwargs.pop("scale", 1.0)
