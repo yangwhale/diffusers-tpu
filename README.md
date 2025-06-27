@@ -169,3 +169,67 @@ image = pipe(prompt=prompt, image=init_image, mask_image=mask_image).images[0]
 ```
 
 You can also run this example on colab [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/huggingface/notebooks/blob/main/diffusers/in_painting_with_stable_diffusion_using_diffusers.ipynb)
+
+
+## TPU Optimization and Performance
+
+This repository includes TPU-optimized implementations with support for various parallelization strategies:
+
+### Wan Video Generation Model
+
+The Wan model has been optimized for TPU inference with the following features:
+
+- **JAX/TorchAX Integration**: Seamless PyTorch to JAX interoperability using torchax
+- **Data Parallel (DP)**: Batch-level parallelization across TPU devices
+- **Tensor Parallel (TP)**: Model parameter sharding across devices  
+- **Sequence Parallel (SP)**: Sequence-level parallelization for memory optimization
+- **Flash/Splash Attention**: Memory-efficient attention mechanisms for TPU
+
+### Performance Benchmarks
+
+#### Sequence Parallel (SP) Performance
+
+The following benchmarks were conducted on TPU v6e-16 devices:
+
+| Configuration | DP | TP | SP | Execution Time |
+|---------------|----|----|----|--------------| 
+| Baseline      | 2  | 4  | 1  | ~400s         |
+| SP Optimized  | 2  | 4  | 2  | 319s          |
+
+**Performance Improvement**: ~20% reduction in execution time with SP=2 configuration.
+
+### Usage Examples
+
+#### Basic TPU Inference
+
+```python
+# Run with data parallel support
+python wan_tx.py --use_dp
+
+# Run with Splash Attention optimization  
+python wan_tx_splash_attn.py --use_dp
+```
+
+#### Advanced Parallelization
+
+The TPU mesh configuration supports multi-dimensional parallelization:
+
+```python
+# Configure TPU mesh: (tp_dim=4, dp_dim=2, sp_dim=2)
+# Total devices: 4 * 2 * 2 = 16 (v6e-16)
+```
+
+### Key Optimizations
+
+1. **Sharding Constraints**: Proper tensor distribution using JAX PartitionSpec
+2. **Memory Efficiency**: Flash/Splash Attention reduces memory footprint
+3. **Compilation Optimization**: TorchAX compilation system compatibility
+4. **Mixed Precision**: bfloat16 support for improved performance
+
+### Files Structure
+
+- [`wan_tx.py`](wan_tx.py): Main inference script with TPU optimizations
+- [`wan_tx_splash_attn.py`](wan_tx_splash_attn.py): Splash Attention variant
+- [`src/diffusers/models/transformers/transformer_wan.py`](src/diffusers/models/transformers/transformer_wan.py): Core transformer with SP support
+- [`src/diffusers/pipelines/wan/pipeline_wan.py`](src/diffusers/pipelines/wan/pipeline_wan.py): TPU-optimized pipeline
+- [`src/diffusers/models/autoencoders/autoencoder_kl_wan.py`](src/diffusers/models/autoencoders/autoencoder_kl_wan.py): VAE with bfloat16 optimizations
