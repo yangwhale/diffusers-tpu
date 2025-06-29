@@ -44,6 +44,7 @@ from datetime import datetime
 # import torchax.ops.jtorch
 import traceback
 import types
+import argparse
 
 #### SETTINGS
 # 1.3B
@@ -359,14 +360,6 @@ def scaled_dot_product_attention(
   #print(f"  env.config.use_tpu_splash_attention={env.config.use_tpu_splash_attention if env else 'None'}")
 
   # <--- MODIFIED: Disable splash attention for VAE --->
-  # VAE typically has different attention patterns, disable splash attention for it
-  # Check if this is likely VAE attention by looking at the shape
-  if query.shape[-1] >= 385:  # VAE typically has larger hidden dimensions (384)
-    #print(f"[DEBUG] Using reference implementation (VAE detected)")
-    # Use reference implementation for VAE
-    return _sdpa_reference(query, key, value, attn_mask, dropout_p, is_causal,
-                           scale, enable_gqa)
-  
   if env.config.use_tpu_splash_attention:
     #print(f"[DEBUG] Using splash attention")
     jquery, jkey, jvalue = env.t2j_iso((query, key, value))
@@ -379,52 +372,6 @@ def scaled_dot_product_attention(
                          scale, enable_gqa)
 
 ###
-
-# Custom WanPipeline class to handle JAX VAE
-class JaxWanPipeline:
-    def __init__(self, original_pipeline, jax_vae, vae_cache):
-        self.original_pipeline = original_pipeline
-        self.jax_vae = jax_vae
-        self.vae_cache = vae_cache
-        self.scheduler = original_pipeline.scheduler
-        self.text_encoder = original_pipeline.text_encoder
-        self.transformer = original_pipeline.transformer
-        
-    def __call__(self, prompt, negative_prompt, height, width, num_inference_steps, num_frames, guidance_scale, output_type="pil"):
-        # Use original pipeline for everything except VAE
-        result = self.original_pipeline(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            height=height,
-            width=width,
-            num_inference_steps=num_inference_steps,
-            num_frames=num_frames,
-            guidance_scale=guidance_scale,
-            output_type="latent"  # Force latent output to use our JAX VAE
-        )
-        
-        if output_type == "latent":
-            return result
-        
-        # Decode latents using JAX VAE
-        latents = result.latents
-        # Convert torch tensor to jax array
-        latents_jax = jnp.array(latents.detach().cpu().numpy())
-        
-        # Decode using JAX VAE
-        decoded = self.jax_vae.decode(latents_jax, feat_cache=self.vae_cache)
-        video = decoded.sample
-        
-        # Convert back to torch tensor and format
-        video_torch = torch.from_numpy(np.array(video)).to(latents.device)
-        video_torch = video_torch.permute(0, 4, 1, 2, 3)  # (B, C, T, H, W)
-        
-        # Create result object similar to original pipeline
-        class Result:
-            def __init__(self, frames):
-                self.frames = frames
-        
-        return Result([video_torch])
 
 # Fix for torch2jax compatibility issue
 def load_wan_vae_fixed(pretrained_model_name_or_path: str, eval_shapes: dict, device: str, hf_download: bool = True):
@@ -551,10 +498,13 @@ def prepare_video_for_export(video):
         print("原始 shape:", video.shape)
         if video.dim() == 5:  # (B, C, T, H, W)
             video = video[0]
-        if video.dim() == 4:  # (C, T, H, W)
+        if video.dim() == 4 and video.shape[0] != args.frames:  # (C, T, H, W)
             video = video.permute(1, 0, 2, 3)
         # (T, C, H, W) -> (T, H, W, C)
-        video = video.permute(0, 2, 3, 1)
+        if video.shape[-1] == 3:
+            pass
+        else:
+            video = video.permute(0, 2, 3, 1)
         print("转置后 shape:", video.shape)
         if video.shape[-1] > 3:
             video = video[..., :3]
@@ -597,9 +547,6 @@ def sharded_device_put(tensor, sharding):
   return jax.make_array_from_single_device_arrays(shape, sharding, x_split)
 
 def main():
-  # For modify depend on host devices
-  global USE_DP
-  
   # Set JAX config to enable compilation cache
   jax.config.update("jax_compilation_cache_dir", "/dev/shm/jax_cache")
   jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
@@ -610,7 +557,7 @@ def main():
   # Available models: Wan-AI/Wan2.1-T2V-14B-Diffusers, Wan-AI/Wan2.1-T2V-1.3B-Diffusers
   #model_id = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
   # model_id = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
-  model_id = MODEL_ID
+  model_id = args.model_id
   
   # Initialize JAX environment first
   torchax.enable_globally()
@@ -618,13 +565,13 @@ def main():
   # Create a 2D mesh for FSDP sharding
   
   tp_dim, dp_dim, sp_dim = len(jax.devices()), 1, 1
-  if USE_DP:
+  if args.use_dp:
     # tp_dim > 8, which is v6e-16, could not divide head_dim=40, need use dp
     print(f"{USE_DP=}")
     tp_dim //= 2
     dp_dim = 2
   
-  if USE_SP:
+  if args.use_sp:
     print(f"{USE_SP=}")
     tp_dim //= 2
     sp_dim = 2
@@ -674,7 +621,7 @@ def main():
   
   try:
     # flow_shift = 5.0 # 5.0 for 720P, 3.0 for 480P
-    flow_shift = FLOW_SHIFT
+    flow_shift = args.flow_shift
     scheduler = UniPCMultistepScheduler(prediction_type='flow_prediction', use_flow_sigmas=True, num_train_timesteps=1000, flow_shift=flow_shift)
     
     # Load pipeline without VAE to avoid torchax interference
@@ -727,7 +674,7 @@ def main():
   custom_attention = functools.partial(
       scaled_dot_product_attention,
       env=env,
-      window_size=WINDOW_SIZE # Inject the global window size setting here
+      window_size=args.window_size # Inject the global window size setting here
   )
   # Workaround for the function lack is_view_op argument
   # env.override_op_definition(torch.nn.functional.scaled_dot_product_attention, custom_attention)
@@ -814,13 +761,13 @@ def main():
     output = pipe(
         prompt=prompt,
         negative_prompt=negative_prompt,
-        height=HEIGHT,
-        width=WIDTH,
-        num_inference_steps=NUM_STEP,
-        num_frames=FRAMES,
+        height=args.height,
+        width=args.width,
+        num_inference_steps=args.num_inference_steps,
+        num_frames=args.frames,
         guidance_scale=5.0,
         generator=generator,
-        use_dp=USE_DP,
+        use_dp=args.use_dp,
     ).frames[0]
     #print("output type:", type(output))
     #if hasattr(output, 'shape'):
@@ -862,13 +809,13 @@ def main():
       output = pipe(
           prompt=prompt,
           negative_prompt=negative_prompt,
-          height=HEIGHT,
-          width=WIDTH,
-          num_inference_steps=NUM_STEP,
-          num_frames=FRAMES,
+          height=args.height,
+          width=args.width,
+          num_inference_steps=args.num_inference_steps,
+          num_frames=args.frames,
           guidance_scale=5.0,
           generator=generator,
-          use_dp=USE_DP,
+          use_dp=args.use_dp,
       )
       # make sure all computation done
       jax.effects_barrier()
@@ -877,5 +824,23 @@ def main():
         
   print('DONE')
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_id", type=str, default=MODEL_ID)
+    parser.add_argument("--flow_shift", type=float, default=FLOW_SHIFT)
+    parser.add_argument("--width", type=int, default=WIDTH)
+    parser.add_argument("--height", type=int, default=HEIGHT)
+    parser.add_argument("--frames", type=int, default=FRAMES)
+    parser.add_argument("--fps", type=int, default=FPS)
+    parser.add_argument("--num_inference_steps", type=int, default=NUM_STEP)
+    parser.add_argument("--window_size", type=int, nargs=2, default=None)
+    parser.add_argument("--use_dp", action="store_true", default=USE_DP)
+    parser.add_argument("--use_sp", action="store_true", default=USE_SP)
+    parser.add_argument("--teacache_thresh", type=float, default=0.2)
+    parser.add_argument("--use_ret_steps", action="store_true", default=False)
+    parser.add_argument("--enable_teacache", action="store_true", default=False)
+    return parser.parse_args()
+
 if __name__ == '__main__':
+  args = parse_args()
   main()
