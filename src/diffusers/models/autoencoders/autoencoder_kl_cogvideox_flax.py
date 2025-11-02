@@ -1030,14 +1030,14 @@ class FlaxCogVideoXUpBlock3D(nnx.Module):
                             method='nearest'
                         )
                     else:
-                        # Single frame: squeeze time, upsample spatially, unsqueeze
-                        hidden_states = hidden_states.reshape(B, H, W, C)
+                        # Single frame with compress_time: upsample to 2 frames AND spatial 2x
+                        # 输入: (B, 1, H, W, C) → 输出: (B, 2, H*2, W*2, C)
+                        # 使用 jax.image.resize 同时对时间和空间维度进行上采样
                         hidden_states = jax.image.resize(
                             hidden_states,
-                            (B, H * 2, W * 2, C),
+                            (B, 2, H * 2, W * 2, C),  # 时间维度 1→2，空间维度 2x
                             method='nearest'
                         )
-                        hidden_states = hidden_states[:, None, :, :, :]  # Add time dim
                 else:
                     # Only interpolate spatial dimensions (2D)
                     # Combine batch and time for processing
