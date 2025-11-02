@@ -1436,8 +1436,10 @@ class FlaxAutoencoderKLCogVideoX(nnx.Module):
         self.tile_overlap_factor_width = 1 / 5
         
         # Frame batch sizes for processing
-        self.num_latent_frames_batch_size = 2
-        self.num_sample_frames_batch_size = 8
+        # decode 时必须逐帧处理（batch=1）以避免 OOM
+        # batch=2 会导致 40GB 内存需求，超过 TPU v6e 的 32GB 限制
+        self.num_latent_frames_batch_size = 1  # decode 时每批 1 帧
+        self.num_sample_frames_batch_size = 8  # encode 时每批 8 帧
     
     def enable_tiling(
         self,
@@ -1566,30 +1568,61 @@ class FlaxAutoencoderKLCogVideoX(nnx.Module):
         if self.use_tiling and (width > self.tile_latent_min_width or height > self.tile_latent_min_height):
             return self.tiled_decode(z, zq, deterministic=deterministic)
         
-        # Frame batching
+        # 帧批处理策略（类似 encoder）：
+        # - Python for 循环按批处理（不 JIT）→ 避免循环展开
+        # - 每批调用 JIT 优化的 decoder → 加速计算
+        # - 通过 conv_cache 保持帧间连续性
+        
         frame_batch_size = self.num_latent_frames_batch_size
         num_batches = max(num_frames // frame_batch_size, 1)
         conv_cache = None
-        dec = []
+        decoded_frames_list = []
         
         for i in range(num_batches):
+            # 计算当前批次的帧范围（处理余数）
             remaining_frames = num_frames % frame_batch_size
             start_frame = frame_batch_size * i + (0 if i == 0 else remaining_frames)
             end_frame = frame_batch_size * (i + 1) + remaining_frames
-            z_intermediate = z[:, start_frame:end_frame, :, :, :]
-            zq_intermediate = zq[:, start_frame:end_frame, :, :, :]
             
+            # 提取当前批次
+            z_batch = z[:, start_frame:end_frame, :, :, :]
+            zq_batch = zq[:, start_frame:end_frame, :, :, :]
+            
+            # 应用 post_quant_conv（如果存在）
             if self.post_quant_conv is not None:
-                z_intermediate = self.post_quant_conv(z_intermediate)
+                z_batch = self.post_quant_conv(z_batch)
             
-            z_intermediate, conv_cache = self.decoder(
-                z_intermediate, zq_intermediate, conv_cache=conv_cache, deterministic=deterministic
+            # 使用 JIT 优化的批处理（见 _decode_batch_jit）
+            decoded_batch, conv_cache = self._decode_batch_jit(
+                z_batch, zq_batch, conv_cache, deterministic
             )
             
-            dec.append(z_intermediate)
+            decoded_frames_list.append(decoded_batch)
         
-        dec = jnp.concatenate(dec, axis=1)
-        return dec
+        # 拼接所有批次
+        decoded = jnp.concatenate(decoded_frames_list, axis=1)
+        return decoded
+    
+    @nnx.jit
+    def _decode_batch_jit(
+        self,
+        z_batch: jnp.ndarray,
+        zq_batch: jnp.ndarray,
+        conv_cache: Optional[Dict[str, jnp.ndarray]],
+        deterministic: bool,
+    ):
+        """
+        JIT 优化的批量 decoder 调用。
+        
+        这个方法对批量帧处理进行 JIT 编译以加速，
+        但不会导致外层循环展开（因为循环在 _decode 中）。
+        
+        类似于 MaxDiffusion 的 transformer_forward_pass 策略。
+        支持一次处理多帧（由 num_latent_frames_batch_size 控制）。
+        """
+        return self.decoder(
+            z_batch, zq_batch, conv_cache=conv_cache, deterministic=deterministic
+        )
     
     def decode(self, z: jnp.ndarray, zq: Optional[jnp.ndarray] = None, deterministic: bool = True) -> jnp.ndarray:
         """
