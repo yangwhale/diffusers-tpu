@@ -528,29 +528,27 @@ class FlaxGroupNorm(nnx.Module):
             assert C == self.num_channels
             assert C % self.num_groups == 0
             
-            # Convert to channel-first: (B, T, H, W, C) -> (B, C, T, H, W)
-            x_cf = x.transpose(0, 4, 1, 2, 3)
+            # 优化内存使用：减少中间张量创建
+            # 直接在 channel-last 格式计算 group 统计量
+            channels_per_group = C // self.num_groups
             
-            # Now apply GroupNorm in channel-first format (matching diffusers_tpu)
-            # Reshape to group structure: (B, num_groups, C//num_groups, T, H, W)
-            x_grouped = x_cf.reshape(B, self.num_groups, C // self.num_groups, T, H, W)
+            # Reshape to expose groups: (B, T, H, W, num_groups, channels_per_group)
+            x_grouped = x.reshape(B, T, H, W, self.num_groups, channels_per_group)
             
-            # Compute mean and variance over (C//num_groups, T, H, W)
-            # This matches PyTorch GroupNorm exactly
-            mean = jnp.mean(x_grouped, axis=(2, 3, 4, 5), keepdims=True)
-            var = jnp.var(x_grouped, axis=(2, 3, 4, 5), keepdims=True)
+            # Compute stats per group: mean/var over (T, H, W, channels_per_group)
+            # This is mathematically equivalent to PyTorch's channel-first computation
+            mean = jnp.mean(x_grouped, axis=(1, 2, 3, 5), keepdims=True)
+            var = jnp.var(x_grouped, axis=(1, 2, 3, 5), keepdims=True)
             
             # Normalize
             x_norm = (x_grouped - mean) / jnp.sqrt(var + self.epsilon)
             
-            # Reshape back: (B, C, T, H, W)
-            x_norm = x_norm.reshape(B, C, T, H, W)
+            # Reshape back: (B, T, H, W, C)
+            x_norm = x_norm.reshape(B, T, H, W, C)
             
-            # Apply affine transformation (still in channel-first)
-            x_out = x_norm * self.scale.value.reshape(1, C, 1, 1, 1) + self.bias.value.reshape(1, C, 1, 1, 1)
-            
-            # Convert back to channel-last: (B, C, T, H, W) -> (B, T, H, W, C)
-            x_out = x_out.transpose(0, 2, 3, 4, 1)
+            # Apply affine: scale and bias are (C,)
+            # Reshape them to (1, 1, 1, 1, C) for broadcasting
+            x_out = x_norm * self.scale.value.reshape(1, 1, 1, 1, C) + self.bias.value.reshape(1, 1, 1, 1, C)
             
         else:
             # 4D: (B, H, W, C) -> (B, C, H, W)
@@ -1249,8 +1247,6 @@ class FlaxCogVideoXUpBlock3D(nnx.Module):
     ):
         # 新模式：使用 feat_cache/feat_idx（逐帧解码）
         if feat_cache is not None and feat_idx is not None:
-            print(f"[UpBlock] 输入形状: {hidden_states.shape}, compress_time={self.compress_time}")
-            
             for resnet in self.resnets:
                 hidden_states, _ = resnet(
                     hidden_states, temb, zq,
@@ -1637,8 +1633,6 @@ class FlaxCogVideoXDecoder3D(nnx.Module):
         """
         # 新模式：使用 feat_cache/feat_idx
         if feat_cache is not None and feat_idx is not None:
-            print(f"[Decoder] 输入 sample 形状: {sample.shape}")
-            
             # Input conv
             hidden_states, _ = self.conv_in(sample, feat_cache=feat_cache, feat_idx=feat_idx)
             
@@ -1971,7 +1965,7 @@ class FlaxAutoencoderKLCogVideoX(nnx.Module):
             return self.tiled_decode(z, zq, deterministic=deterministic)
         
         # 创建缓存管理器（参考 WAN 的 _decode 实现）
-        # 缓存在所有 latent 帧之间共享，保持时间连续性
+        # 重要：每次调用都创建全新的缓存，避免内存泄漏
         feat_cache_manager = FlaxCogVideoXCache(self.decoder)
         
         # 应用 post_quant_conv 到整个 latent（如果存在）
@@ -1981,33 +1975,38 @@ class FlaxAutoencoderKLCogVideoX(nnx.Module):
         # 逐帧解码（缓存共享，每帧只重置索引）
         decoded_frames_list = []
         
-        for i in range(num_frames):
-            # 每帧重置索引（不清空缓存，保持帧间连续性）
-            feat_cache_manager._conv_idx = [0]
+        try:
+            for i in range(num_frames):
+                # 每帧重置索引（不清空缓存，保持帧间连续性）
+                feat_cache_manager._conv_idx = [0]
+                
+                # 提取当前 latent 帧
+                z_frame = z[:, i:i+1, :, :, :]
+                zq_frame = zq[:, i:i+1, :, :, :]
+                
+                # 使用共享缓存解码当前帧
+                # 每个 latent 帧会被上采样到 temporal_compression_ratio 倍的视频帧
+                decoded_frame, _ = self.decoder(
+                    z_frame, zq_frame,
+                    feat_cache=feat_cache_manager._feat_map,
+                    feat_idx=feat_cache_manager._conv_idx,
+                    deterministic=deterministic
+                )
+                
+                decoded_frames_list.append(decoded_frame)
+                decoded_frames_list.append(decoded_frame)
             
-            # 提取当前 latent 帧
-            z_frame = z[:, i:i+1, :, :, :]
-            zq_frame = zq[:, i:i+1, :, :, :]
+            # 拼接所有解码后的帧
+            decoded = jnp.concatenate(decoded_frames_list, axis=1)
+            decoded = jnp.clip(decoded, min=-1.0, max=1.0)
             
-            print(f"[_decode] latent 帧 {i}: z_frame 形状 {z_frame.shape}")
-            
-            # 使用共享缓存解码当前帧
-            # 每个 latent 帧会被上采样到 temporal_compression_ratio 倍的视频帧
-            decoded_frame, _ = self.decoder(
-                z_frame, zq_frame,
-                feat_cache=feat_cache_manager._feat_map,
-                feat_idx=feat_cache_manager._conv_idx,
-                deterministic=deterministic
-            )
-            
-            print(f"[_decode] latent 帧 {i}: decoded_frame 形状 {decoded_frame.shape}")
-            decoded_frames_list.append(decoded_frame)
-        
-        # 拼接所有解码后的帧
-        decoded = jnp.concatenate(decoded_frames_list, axis=1)
-        decoded = jnp.clip(decoded, min=-1.0, max=1.0)
-        
-        return decoded
+            return decoded
+        finally:
+            # 显式清理缓存，释放内存
+            feat_cache_manager._feat_map = None
+            feat_cache_manager._conv_idx = None
+            del feat_cache_manager
+            decoded_frames_list = None
     
     def decode(self, z: jnp.ndarray, zq: Optional[jnp.ndarray] = None, deterministic: bool = True) -> jnp.ndarray:
         """
