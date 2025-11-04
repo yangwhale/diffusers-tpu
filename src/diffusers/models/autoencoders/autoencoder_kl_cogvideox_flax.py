@@ -409,23 +409,31 @@ class FlaxCogVideoXCausalConv3d(nnx.Module):
                     )
                     x = jnp.concatenate([padding_frames, inputs], axis=1)
                 
-                # 更新缓存：保存拼接后 x 的最后 CACHE_T 帧（参考 WAN 第 432-436 行）
-                # 如果 inputs 本身不足 2 帧，需要从旧缓存和新输入组合
+                # ⚠️ 关键修复：缓存更新逻辑（严格参考 WAN 第 432-436 行）
+                # 必须使用卷积后的结果 x2（而非原始 inputs）来更新缓存
+                # 先执行卷积，获取输出
+                x2 = self.conv(x)
+                
+                # 更新缓存：从拼接后的 x（卷积前）保存最后 CACHE_T 帧
                 if inputs.shape[1] < self.CACHE_T and feat_cache[idx] is not None:
-                    # inputs 不足 2 帧：从旧缓存取最后 1 帧 + inputs 的最后 CACHE_T 帧
-                    cache_x = jnp.concatenate([
+                    # inputs 不足 2 帧：从旧缓存取最后 1 帧 + inputs 的全部帧
+                    feat_cache[idx] = jnp.concatenate([
                         jnp.expand_dims(feat_cache[idx][:, -1, :, :, :], axis=1),
                         inputs[:, -self.CACHE_T:, :, :, :]
                     ], axis=1)
                 else:
-                    # inputs 足够或第一次：直接取 inputs 的最后 CACHE_T 帧
-                    cache_x = inputs[:, -self.CACHE_T:, :, :, :]
+                    # inputs 足够：直接取 inputs 的最后 CACHE_T 帧
+                    feat_cache[idx] = inputs[:, -self.CACHE_T:, :, :, :]
                 
-                feat_cache[idx] = cache_x
+                # 索引递增
+                feat_idx[0] += 1
+                
+                # 返回卷积输出
+                return x2, None
             else:
                 x = inputs
         
-        # 执行卷积
+        # 执行卷积（非缓存路径）
         output = self.conv(x)
         
         # 索引递增
@@ -1985,7 +1993,7 @@ class FlaxAutoencoderKLCogVideoX(nnx.Module):
                 zq_frame = zq[:, i:i+1, :, :, :]
                 
                 # 使用共享缓存解码当前帧
-                # 每个 latent 帧会被上采样到 temporal_compression_ratio 倍的视频帧
+                # 每个 latent 帧会被上采样到 temporal_compression_ratio 倍的视频帧 (通常是 4 帧)
                 decoded_frame, _ = self.decoder(
                     z_frame, zq_frame,
                     feat_cache=feat_cache_manager._feat_map,
@@ -1993,7 +2001,8 @@ class FlaxAutoencoderKLCogVideoX(nnx.Module):
                     deterministic=deterministic
                 )
                 
-                decoded_frames_list.append(decoded_frame)
+                # 直接添加解码结果
+                # CogVideoX 使用 jax.image.resize 进行时序上采样，不需要帧顺序修正
                 decoded_frames_list.append(decoded_frame)
             
             # 拼接所有解码后的帧
