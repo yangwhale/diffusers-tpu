@@ -1967,7 +1967,38 @@ class FlaxAutoencoderKLCogVideoX(nnx.Module):
         Returns:
             Decoded video (B, T*temporal_compression_ratio, H, W, C)
         """
+        import os
+        
+        # 内存监控开关（通过环境变量控制）
+        # 使用方法: export JAX_MEMORY_DEBUG=1
+        enable_memory_debug = os.getenv('JAX_MEMORY_DEBUG', '0') == '1'
+        
+        def get_memory_stats():
+            """获取当前设备内存统计信息"""
+            if not enable_memory_debug:
+                return ""
+            try:
+                # 获取所有设备的内存统计
+                for device in jax.devices():
+                    stats = device.memory_stats()
+                    if stats:
+                        used_gb = stats.get('bytes_in_use', 0) / 1e9
+                        limit_gb = stats.get('bytes_limit', 0) / 1e9
+                        return f"{used_gb:.2f}GB / {limit_gb:.2f}GB"
+            except:
+                pass
+            return "N/A"
+        
+        def log_memory(msg):
+            """记录内存状态（仅在开启调试时）"""
+            if enable_memory_debug:
+                print(f"[内存] {msg}: {get_memory_stats()}")
+        
         batch_size, num_frames, height, width, num_channels = z.shape
+        
+        if enable_memory_debug:
+            print(f"\n[VAE Decode] 开始解码: {num_frames} latent frames -> {num_frames * 4} video frames")
+        log_memory("解码前")
         
         if self.use_tiling and (width > self.tile_latent_min_width or height > self.tile_latent_min_height):
             return self.tiled_decode(z, zq, deterministic=deterministic)
@@ -1975,10 +2006,12 @@ class FlaxAutoencoderKLCogVideoX(nnx.Module):
         # 创建缓存管理器（参考 WAN 的 _decode 实现）
         # 重要：每次调用都创建全新的缓存，避免内存泄漏
         feat_cache_manager = FlaxCogVideoXCache(self.decoder)
+        log_memory("创建缓存管理器后")
         
         # 应用 post_quant_conv 到整个 latent（如果存在）
         if self.post_quant_conv is not None:
             z = self.post_quant_conv(z)
+            log_memory("post_quant_conv 后")
         
         # 逐帧解码（缓存共享，每帧只重置索引）
         decoded_frames_list = []
@@ -2004,18 +2037,35 @@ class FlaxAutoencoderKLCogVideoX(nnx.Module):
                 # 直接添加解码结果
                 # CogVideoX 使用 jax.image.resize 进行时序上采样，不需要帧顺序修正
                 decoded_frames_list.append(decoded_frame)
+                
+                # 每 8 帧打印一次内存状态
+                if enable_memory_debug and ((i + 1) % 8 == 0 or i == 0):
+                    log_memory(f"解码第 {i+1}/{num_frames} 帧后")
+            
+            log_memory("所有帧解码完成，准备拼接")
             
             # 拼接所有解码后的帧
             decoded = jnp.concatenate(decoded_frames_list, axis=1)
+            log_memory("拼接完成")
+            
             decoded = jnp.clip(decoded, min=-1.0, max=1.0)
+            log_memory("clip 完成")
             
             return decoded
         finally:
-            # 显式清理缓存，释放内存
+            log_memory("开始清理缓存")
+            
+            # 显式清理所有缓存和中间变量
+            for i in range(len(feat_cache_manager._feat_map)):
+                feat_cache_manager._feat_map[i] = None
             feat_cache_manager._feat_map = None
             feat_cache_manager._conv_idx = None
             del feat_cache_manager
             decoded_frames_list = None
+            
+            log_memory("清理缓存完成")
+            if enable_memory_debug:
+                print(f"[内存] 解码结束\n")
     
     def decode(self, z: jnp.ndarray, zq: Optional[jnp.ndarray] = None, deterministic: bool = True) -> jnp.ndarray:
         """
