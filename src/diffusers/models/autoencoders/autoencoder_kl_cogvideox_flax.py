@@ -124,65 +124,6 @@ class FlaxAutoencoderKLCogVideoXConfig:
         # Dataclass 会自动处理，不需要手动设置
         pass
     
-    def OLD__init__(
-        self,
-        in_channels: int = 3,
-        out_channels: int = 3,
-        down_block_types: Tuple[str, ...] = (
-            "CogVideoXDownBlock3D",
-            "CogVideoXDownBlock3D",
-            "CogVideoXDownBlock3D",
-            "CogVideoXDownBlock3D",
-        ),
-        up_block_types: Tuple[str, ...] = (
-            "CogVideoXUpBlock3D",
-            "CogVideoXUpBlock3D",
-            "CogVideoXUpBlock3D",
-            "CogVideoXUpBlock3D",
-        ),
-        block_out_channels: Tuple[int, ...] = (128, 256, 256, 512),
-        latent_channels: int = 16,
-        layers_per_block: int = 3,
-        act_fn: str = "silu",
-        norm_eps: float = 1e-6,
-        norm_num_groups: int = 32,
-        temporal_compression_ratio: float = 4,
-        sample_height: int = 480,
-        sample_width: int = 720,
-        scaling_factor: float = 1.15258426,
-        shift_factor: Optional[float] = None,
-        latents_mean: Optional[Tuple[float]] = None,
-        latents_std: Optional[Tuple[float]] = None,
-        force_upcast: bool = True,
-        use_quant_conv: bool = False,
-        use_post_quant_conv: bool = False,
-        pad_mode: str = "first",
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.down_block_types = down_block_types
-        self.up_block_types = up_block_types
-        self.block_out_channels = block_out_channels
-        self.latent_channels = latent_channels
-        self.layers_per_block = layers_per_block
-        self.act_fn = act_fn
-        self.norm_eps = norm_eps
-        self.norm_num_groups = norm_num_groups
-        self.temporal_compression_ratio = temporal_compression_ratio
-        self.sample_height = sample_height
-        self.sample_width = sample_width
-        self.scaling_factor = scaling_factor
-        self.shift_factor = shift_factor
-        self.latents_mean = latents_mean
-        self.latents_std = latents_std
-        self.force_upcast = force_upcast
-        self.use_quant_conv = use_quant_conv
-        self.use_post_quant_conv = use_post_quant_conv
-        # 这些赋值由 dataclass 自动处理
-        pass
-
 
 class FlaxConv3d(nnx.Module):
     """Basic 3D convolution wrapper for Flax NNX."""
@@ -310,6 +251,8 @@ class FlaxCogVideoXCausalConv3d(nnx.Module):
         self.pad_mode = pad_mode
         self.time_kernel_size = time_kernel_size
         self.temporal_dim = 1  # In JAX NTHWC format, time is dim 1
+        self.in_channels = in_channels  # Store for cache initialization (缓存存储的是输入帧)
+        self.out_channels = out_channels # Store for output shape
         
         # Padding for constant mode (spatial only, time handled separately)
         const_padding_conv3d = (0, self.height_pad, self.width_pad)
@@ -393,10 +336,12 @@ class FlaxCogVideoXCausalConv3d(nnx.Module):
             # 保留最后 CACHE_T 帧用于下次调用
             # 注意：如果输入是多帧，我们保留输入的最后几帧
             if T_in >= self.CACHE_T:
-                self.decode_cache.value = inputs[:, -self.CACHE_T:, ...]
+                new_cache_val = inputs[:, -self.CACHE_T:, ...]
             else:
                 # 输入帧数少于 CACHE_T，从拼接后的 x 中取
-                self.decode_cache.value = x[:, -self.CACHE_T:, ...]
+                new_cache_val = x[:, -self.CACHE_T:, ...]
+            
+            self.decode_cache.value = new_cache_val
             
             return output
         else:
@@ -1317,10 +1262,13 @@ class FlaxCogVideoXDecoder3D(nnx.Module):
         return hidden_states
     
     def reset_caching_state(self):
-        """重置解码器中所有 CausalConv3d 层的缓存状态"""
-        # 遍历解码器的所有子模块
-        for _, module in nnx.graph.iter_graph(self):
-            # 如果发现了我们定义的缓存变量，就把它重置为 None
+        """重置解码器中所有 CausalConv3d 层的缓存状态为 None。
+        
+        每个层会在第一次调用时自动初始化自己的缓存，使用实际输入的形状。
+        这样可以避免空间尺寸不匹配的问题（不同层的特征图尺寸不同）。
+        """
+        # 遍历解码器的所有子模块，将所有缓存重置为 None
+        for path, module in nnx.graph.iter_graph(self):
             if isinstance(module, DecodeCache):
                 module.value = None
 
@@ -1535,9 +1483,9 @@ class FlaxAutoencoderKLCogVideoX(nnx.Module):
     
     def _decode(self, z: jnp.ndarray, zq: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
         """
-        Internal decode with frame-by-frame processing using internal JAX state.
+        Internal decode with frame-by-frame processing using jax.lax.scan.
         
-        使用内部 JAX 状态进行逐帧解码，配合 JIT 加速。
+        使用 scan 进行高效的逐帧解码，配合 JIT 加速。
         
         Args:
             z: Latent representation (B, T, H, W, C)
@@ -1552,34 +1500,70 @@ class FlaxAutoencoderKLCogVideoX(nnx.Module):
         if self.use_tiling and (width > self.tile_latent_min_width or height > self.tile_latent_min_height):
             return self.tiled_decode(z, zq, deterministic=deterministic)
         
-        # 1. 【重要】开始前重置缓存！
-        self.decoder.reset_caching_state()
-        
         # 应用 post_quant_conv 到整个 latent（如果存在）
         if self.post_quant_conv is not None:
             z = self.post_quant_conv(z)
         
-        # 2. 逐帧解码（不使用 JIT，避免内存峰值）
-        # 使用内部状态管理缓存，应该比外部 Python 列表更高效
-        decoded_frames_list = []
+        # 【关键修复】先解码第一帧来初始化所有 decode_cache
+        # 1. 重置为 None
+        self.decoder.reset_caching_state()
         
-        for i in range(num_frames):
-            z_f = z[:, i:i+1]
-            zq_f = zq[:, i:i+1]
+        # 2. 解码第一帧，初始化所有缓存
+        z_first = z[:, 0:1, :, :, :]
+        zq_first = zq[:, 0:1, :, :, :]
+        first_decoded = self.decoder(z_first, zq=zq_first, is_decoding=True, deterministic=deterministic)
+        
+        # 3. 如果只有一帧，直接返回
+        if num_frames == 1:
+            return first_decoded
+        
+        # 4. 对剩余帧使用 scan 进行批量解码
+        @nnx.jit
+        def run_scan_decode(decoder_model, z_input, zq_input, first_frame):
+            def scan_body(carry, xs):
+                graphdef, state = carry
+                z_frame, zq_frame = xs
+                model = nnx.merge(graphdef, state)
+                
+                # 添加时间维度
+                z_frame_t = jnp.expand_dims(z_frame, axis=1)
+                zq_frame_t = jnp.expand_dims(zq_frame, axis=1)
+                
+                decoded_frame = model(
+                    z_frame_t,
+                    zq=zq_frame_t,
+                    temb=None,
+                    is_decoding=True,
+                    deterministic=deterministic
+                )
+                
+                new_graphdef, new_state = nnx.split(model)
+                return (new_graphdef, new_state), decoded_frame
             
-            # 直接调用解码器，使用 is_decoding=True 激活内部缓存
-            decoded_frame = self.decoder(
-                z_f,
-                zq=zq_f,
-                temb=None,
-                is_decoding=True,
-                deterministic=deterministic
+            # 跳过第一帧（已经解码），从第二帧开始 scan
+            z_rest = z_input[:, 1:, :, :, :]
+            zq_rest = zq_input[:, 1:, :, :, :]
+            
+            # 转置为 (T-1, B, H, W, C) 以便 scan
+            z_scannable = jnp.transpose(z_rest, (1, 0, 2, 3, 4))
+            zq_scannable = jnp.transpose(zq_rest, (1, 0, 2, 3, 4))
+            
+            graphdef, state = nnx.split(decoder_model)
+            
+            (final_graphdef, final_state), decoded_rest = jax.lax.scan(
+                scan_body, (graphdef, state), (z_scannable, zq_scannable)
             )
-            decoded_frames_list.append(decoded_frame)
+            
+            # 更新 decoder 状态
+            nnx.merge(final_graphdef, final_state, graph_nodes=decoder_model)
+            
+            # 转回 (B, T-1, H, W, C) 并与第一帧合并
+            decoded_rest_transposed = jnp.transpose(decoded_rest, (1, 0, 2, 3, 4))
+            return jnp.concatenate([first_frame, decoded_rest_transposed], axis=1)
         
-        # 3. 拼接结果
-        decoded = jnp.concatenate(decoded_frames_list, axis=1)
+        decoded = run_scan_decode(self.decoder, z, zq, first_decoded)
         return decoded
+    
     
     def decode(self, z: jnp.ndarray, zq: Optional[jnp.ndarray] = None, deterministic: bool = True) -> jnp.ndarray:
         """
@@ -1694,8 +1678,10 @@ class FlaxAutoencoderKLCogVideoX(nnx.Module):
         for i in range(0, height, overlap_height):
             row = []
             for j in range(0, width, overlap_width):
+                # 重置 decoder 的缓存状态（每个tile独立）
+                self.decoder.reset_caching_state()
+                
                 num_batches = max(num_frames // frame_batch_size, 1)
-                conv_cache = None
                 time = []
                 
                 for k in range(num_batches):
@@ -1722,7 +1708,8 @@ class FlaxAutoencoderKLCogVideoX(nnx.Module):
                     if self.post_quant_conv is not None:
                         tile = self.post_quant_conv(tile)
                     
-                    tile, conv_cache = self.decoder(tile, tile_zq, conv_cache=conv_cache, deterministic=deterministic)
+                    # 使用新的 API（没有 conv_cache 参数）
+                    tile = self.decoder(tile, tile_zq, temb=None, is_decoding=True, deterministic=deterministic)
                     time.append(tile)
                 
                 row.append(jnp.concatenate(time, axis=1))
