@@ -33,6 +33,11 @@ from flax import nnx
 from ...configuration_utils import ConfigMixin
 
 
+class DecodeCache(nnx.Variable):
+    """专门用于存储逐帧解码缓存的变量类型，方便 nnx 管理和分割。"""
+    pass
+
+
 @dataclass
 class FlaxAutoencoderKLCogVideoXConfig:
     """
@@ -259,12 +264,12 @@ class FlaxConv2d(nnx.Module):
 
 class FlaxCogVideoXCausalConv3d(nnx.Module):
     """
-    A 3D causal convolution layer with feat_cache support for CogVideoX.
+    A 3D causal convolution layer with internal cache support for CogVideoX.
     
-    这是支持逐帧解码的 CausalConv3d 实现，参考 WanCausalConv3d 的设计。
+    这是支持逐帧解码的 CausalConv3d 实现，使用内部 JAX 状态管理缓存。
     主要特性：
     - 时间维度因果填充
-    - 通过 feat_cache/feat_idx 支持逐帧处理
+    - 通过内部 decode_cache 支持逐帧处理
     - 支持 'constant' 和 'replicate' 填充模式
     
     Args:
@@ -277,7 +282,7 @@ class FlaxCogVideoXCausalConv3d(nnx.Module):
         rngs (nnx.Rngs): 随机数生成器
     """
     
-    # 类似 WAN，定义缓存需要的帧数
+    # 定义缓存需要的帧数
     CACHE_T = 2
     
     def __init__(
@@ -321,177 +326,81 @@ class FlaxCogVideoXCausalConv3d(nnx.Module):
             padding=0 if self.pad_mode == "replicate" else const_padding_conv3d,
             rngs=rngs,
         )
+        
+        # 【新增】初始化内部缓存
+        # 使用 None 初始值，第一次运行时会自动填充
+        self.decode_cache = DecodeCache(None)
+        
     
-    def __call__(
-        self,
-        inputs: jnp.ndarray,
-        conv_cache: Optional[jnp.ndarray] = None,
-        feat_cache: Optional[list] = None,
-        feat_idx: Optional[list] = None,
-    ):
-        """
-        前向传播，支持两种缓存模式：
-        1. conv_cache: 旧的缓存模式（为了兼容性保留）
-        2. feat_cache/feat_idx: 新的逐帧解码缓存模式（用于解决 OOM）
+    # 【修改】__call__ 签名变了
+    def __call__(self, inputs: jnp.ndarray, is_decoding: bool = False):
+        if is_decoding:
+            return self._call_with_self_cache(inputs)
         
-        Args:
-            inputs: 输入张量 (B, T, H, W, C)
-            conv_cache: 旧模式的缓存（已弃用）
-            feat_cache: 缓存列表（新模式）
-            feat_idx: 当前索引列表（新模式）
-            
-        Returns:
-            output: 卷积输出
-            new_cache: 更新的缓存（仅在旧模式下使用）
-        """
-        # 新模式：使用 feat_cache/feat_idx 进行逐帧解码
-        if feat_cache is not None and feat_idx is not None:
-            return self._call_with_feat_cache(inputs, feat_cache, feat_idx)
-        
-        # 旧模式：使用 conv_cache（保持向后兼容）
-        return self._call_with_conv_cache(inputs, conv_cache)
+        # 这里保留原有的普通前向传播逻辑（用于 encode 或非逐帧 decode）
+        return self._call_standard(inputs)
     
-    def _call_with_feat_cache(
-        self,
-        inputs: jnp.ndarray,
-        feat_cache: list,
-        feat_idx: list,
-    ):
-        """
-        使用 feat_cache 的新缓存模式（参考 WanCausalConv3d）。
-        
-        Args:
-            inputs: 输入张量 (B, T, H, W, C)，通常 T=1（逐帧处理）
-            feat_cache: 缓存列表
-            feat_idx: 当前索引列表 [idx]
-            
-        Returns:
-            output: 卷积输出
-        """
-        idx = feat_idx[0]
-        
-        # 处理时间填充
+    # 【新增】标准的无缓存前向传播
+    def _call_standard(self, inputs: jnp.ndarray):
         if self.pad_mode == "replicate":
-            # Replicate 模式：直接填充
-            pad_width = [
-                (0, 0),  # batch
-                (self.time_pad, 0),  # time (only pad before, causal)
-                (self.height_pad, self.height_pad),  # height
-                (self.width_pad, self.width_pad),  # width
-                (0, 0),  # channels
-            ]
-            x = jnp.pad(inputs, pad_width, mode='edge')
-        else:
-            # Constant 模式：使用缓存（参考 WAN 的实现）
-            if self.time_kernel_size > 1:
-                padding_needed = self.time_kernel_size - 1  # 需要的 padding 帧数
-                
-                # 如果缓存中有数据，使用它
-                if feat_cache[idx] is not None:
-                    cache_len = feat_cache[idx].shape[1]
-                    # 拼接缓存和当前输入
-                    x = jnp.concatenate([feat_cache[idx], inputs], axis=1)
-                    
-                    # 调整还需要的 padding
-                    padding_needed -= cache_len
-                    if padding_needed > 0:
-                        # 缓存不够，补充额外的 padding
-                        extra_padding = jnp.tile(x[:, :1, :, :, :], (1, padding_needed, 1, 1, 1))
-                        x = jnp.concatenate([extra_padding, x], axis=1)
-                    elif padding_needed < 0:
-                        # 缓存太多，裁剪
-                        x = x[:, -padding_needed:, ...]
-                else:
-                    # 第一次调用：重复第一帧作为填充
-                    padding_frames = jnp.tile(
-                        inputs[:, :1, :, :, :],
-                        (1, padding_needed, 1, 1, 1)
-                    )
-                    x = jnp.concatenate([padding_frames, inputs], axis=1)
-                
-                # ⚠️ 关键修复：缓存更新逻辑（严格参考 WAN 第 432-436 行）
-                # 必须使用卷积后的结果 x2（而非原始 inputs）来更新缓存
-                # 先执行卷积，获取输出
-                x2 = self.conv(x)
-                
-                # 更新缓存：从拼接后的 x（卷积前）保存最后 CACHE_T 帧
-                if inputs.shape[1] < self.CACHE_T and feat_cache[idx] is not None:
-                    # inputs 不足 2 帧：从旧缓存取最后 1 帧 + inputs 的全部帧
-                    feat_cache[idx] = jnp.concatenate([
-                        jnp.expand_dims(feat_cache[idx][:, -1, :, :, :], axis=1),
-                        inputs[:, -self.CACHE_T:, :, :, :]
-                    ], axis=1)
-                else:
-                    # inputs 足够：直接取 inputs 的最后 CACHE_T 帧
-                    feat_cache[idx] = inputs[:, -self.CACHE_T:, :, :, :]
-                
-                # 索引递增
-                feat_idx[0] += 1
-                
-                # 返回卷积输出
-                return x2, None
-            else:
-                x = inputs
-        
-        # 执行卷积（非缓存路径）
-        output = self.conv(x)
-        
-        # 索引递增
-        feat_idx[0] += 1
-        
-        # 旧 API 兼容性：返回 (output, None)
-        return output, None
-    
-    def _call_with_conv_cache(self, inputs: jnp.ndarray, conv_cache: Optional[jnp.ndarray]):
-        """
-        旧的 conv_cache 模式（保持向后兼容）。
-        
-        Args:
-            inputs: 输入张量 (B, T, H, W, C)
-            conv_cache: 上一次的缓存
-            
-        Returns:
-            output: 卷积输出
-            new_cache: 更新的缓存
-        """
-        # Apply causal padding
-        if self.pad_mode == "replicate":
-            # Replicate padding mode: pad all dimensions including time
-            pad_width = [
-                (0, 0),  # batch
-                (self.time_pad, 0),  # time (only pad before, causal)
-                (self.height_pad, self.height_pad),  # height
-                (self.width_pad, self.width_pad),  # width
-                (0, 0),  # channels
-            ]
+            pad_width = [(0,0), (self.time_pad, 0), (self.height_pad, self.height_pad), (self.width_pad, self.width_pad), (0,0)]
             inputs = jnp.pad(inputs, pad_width, mode='edge')
-            conv_cache = None
         else:
-            # Constant padding mode: use conv_cache for time dimension
+            # Constant 模式下，如果不是逐帧解码，通常输入已经是完整的视频块了
+            # 这里可以根据需要实现简单的 causal padding (前面补第一帧)
             if self.time_kernel_size > 1:
-                if conv_cache is not None:
-                    # Use provided cache
-                    cached_inputs = conv_cache
-                else:
-                    # First call: repeat first frame
-                    cached_inputs = jnp.tile(
-                        inputs[:, :1, :, :, :],
-                        (1, self.time_kernel_size - 1, 1, 1, 1)
-                    )
-                # Concatenate cache with current input
+                cached_inputs = jnp.tile(inputs[:, :1, ...], (1, self.time_kernel_size - 1, 1, 1, 1))
                 inputs = jnp.concatenate([cached_inputs, inputs], axis=1)
+        return self.conv(inputs)
+    
+    # 【核心修改】使用内部状态的逐帧解码
+    def _call_with_self_cache(self, inputs: jnp.ndarray):
+        # inputs 形状可以是 (B, T, H, W, C)，其中 T 可能 >= 1
+        # 这是为了支持 compress_time 模式下的时间上采样
         
-        # Apply convolution
-        output = self.conv(inputs)
-        
-        # Update cache
         if self.pad_mode == "replicate":
-            new_cache = None
+            # Replicate 模式不需要时序缓存，因为它只看当前帧并复制边缘
+            pad_width = [(0,0), (self.time_pad, 0), (self.height_pad, self.height_pad), (self.width_pad, self.width_pad), (0,0)]
+            x = jnp.pad(inputs, pad_width, mode='edge')
+            return self.conv(x)
+
+        # Constant 模式：需要使用缓存
+        if self.time_kernel_size > 1:
+            T_in = inputs.shape[1]  # 输入的帧数
+            cached_frames = self.decode_cache.value
+
+            if cached_frames is None:
+                # --- 第一次调用 ---
+                # 需要补齐到足以进行第一次卷积的长度
+                padding_needed = self.time_kernel_size - 1
+                if T_in >= self.time_kernel_size:
+                    # 输入已经足够长，使用因果填充
+                    padding_frames = jnp.tile(inputs[:, :1, ...], (1, padding_needed, 1, 1, 1))
+                    x = jnp.concatenate([padding_frames, inputs], axis=1)
+                else:
+                    # 输入不够长，用第一帧填充
+                    padding_frames = jnp.tile(inputs[:, :1, ...], (1, padding_needed, 1, 1, 1))
+                    x = jnp.concatenate([padding_frames, inputs], axis=1)
+            else:
+                # --- 有缓存的情况 ---
+                # 拼接历史缓存和当前输入
+                x = jnp.concatenate([cached_frames, inputs], axis=1)
+
+            # 1. 执行卷积
+            output = self.conv(x)
+            
+            # 2. 更新缓存 (形状稳定的更新)
+            # 保留最后 CACHE_T 帧用于下次调用
+            # 注意：如果输入是多帧，我们保留输入的最后几帧
+            if T_in >= self.CACHE_T:
+                self.decode_cache.value = inputs[:, -self.CACHE_T:, ...]
+            else:
+                # 输入帧数少于 CACHE_T，从拼接后的 x 中取
+                self.decode_cache.value = x[:, -self.CACHE_T:, ...]
+            
+            return output
         else:
-            # Save last (time_kernel_size - 1) frames for next iteration
-            new_cache = inputs[:, -(self.time_kernel_size - 1):, :, :, :]
-        
-        return output, new_cache
+            return self.conv(inputs)
 
 
 class FlaxGroupNorm(nnx.Module):
@@ -621,82 +530,19 @@ class FlaxCogVideoXSpatialNorm3D(nnx.Module):
         self,
         f: jnp.ndarray,
         zq: jnp.ndarray,
-        conv_cache: Optional[Dict[str, jnp.ndarray]] = None,
-        feat_cache: Optional[list] = None,
-        feat_idx: Optional[list] = None,
+        is_decoding: bool = False,
     ):
         """
         Apply spatial normalization with conditioning.
         
-        支持两种模式：
-        1. conv_cache: 旧的缓存模式（保持兼容性）
-        2. feat_cache/feat_idx: 新的逐帧解码模式
-        
         Args:
             f: Feature map of shape (B, T, H, W, C)
             zq: Conditioning latent of shape (B, T', H', W', C')
-            conv_cache: 旧模式的缓存字典
-            feat_cache: 新模式的缓存列表
-            feat_idx: 新模式的索引列表
+            is_decoding: 是否在逐帧解码模式
             
         Returns:
             Normalized and conditioned features
-            Updated cache (conv_cache dict 或 None)
         """
-        # 新模式：使用 feat_cache/feat_idx
-        if feat_cache is not None and feat_idx is not None:
-            return self._call_with_feat_cache(f, zq, feat_cache, feat_idx)
-        
-        # 旧模式：使用 conv_cache
-        return self._call_with_conv_cache(f, zq, conv_cache)
-    
-    def _call_with_feat_cache(
-        self,
-        f: jnp.ndarray,
-        zq: jnp.ndarray,
-        feat_cache: list,
-        feat_idx: list,
-    ):
-        """新缓存模式的实现"""
-        # Handle odd frame counts specially (matching PyTorch implementation)
-        B, T, H, W, C = f.shape
-        if T > 1 and T % 2 == 1:
-            # Split first frame and rest
-            f_first = f[:, :1, :, :, :]
-            f_rest = f[:, 1:, :, :, :]
-            z_first = zq[:, :1, :, :, :]
-            z_rest = zq[:, 1:, :, :, :]
-            
-            # Resize separately
-            z_first = jax.image.resize(z_first, (B, 1, H, W, zq.shape[-1]), method='nearest')
-            z_rest = jax.image.resize(z_rest, (B, T-1, H, W, zq.shape[-1]), method='nearest')
-            
-            # Concatenate back
-            zq = jnp.concatenate([z_first, z_rest], axis=1)
-        else:
-            # Regular resize
-            zq = jax.image.resize(zq, (B, T, H, W, zq.shape[-1]), method='nearest')
-        
-        # Apply conditioning convolutions with feat_cache
-        conv_y, _ = self.conv_y(zq, feat_cache=feat_cache, feat_idx=feat_idx)
-        conv_b, _ = self.conv_b(zq, feat_cache=feat_cache, feat_idx=feat_idx)
-        
-        # Normalize and condition
-        norm_f = self.norm_layer(f)
-        new_f = norm_f * conv_y + conv_b
-        
-        return new_f, None
-    
-    def _call_with_conv_cache(
-        self,
-        f: jnp.ndarray,
-        zq: jnp.ndarray,
-        conv_cache: Optional[Dict[str, jnp.ndarray]],
-    ):
-        """旧缓存模式的实现"""
-        new_conv_cache = {}
-        conv_cache = conv_cache or {}
-        
         # Handle odd frame counts specially (matching PyTorch implementation)
         B, T, H, W, C = f.shape
         if T > 1 and T % 2 == 1:
@@ -717,14 +563,14 @@ class FlaxCogVideoXSpatialNorm3D(nnx.Module):
             zq = jax.image.resize(zq, (B, T, H, W, zq.shape[-1]), method='nearest')
         
         # Apply conditioning convolutions
-        conv_y, new_conv_cache["conv_y"] = self.conv_y(zq, conv_cache=conv_cache.get("conv_y"))
-        conv_b, new_conv_cache["conv_b"] = self.conv_b(zq, conv_cache=conv_cache.get("conv_b"))
+        conv_y = self.conv_y(zq, is_decoding=is_decoding)
+        conv_b = self.conv_b(zq, is_decoding=is_decoding)
         
         # Normalize and condition
         norm_f = self.norm_layer(f)
         new_f = norm_f * conv_y + conv_b
         
-        return new_f, new_conv_cache
+        return new_f
 
 
 # Continue in next message due to length...
@@ -832,57 +678,32 @@ class FlaxCogVideoXResnetBlock3D(nnx.Module):
         inputs: jnp.ndarray,
         temb: Optional[jnp.ndarray] = None,
         zq: Optional[jnp.ndarray] = None,
-        conv_cache: Optional[Dict[str, jnp.ndarray]] = None,
-        feat_cache: Optional[list] = None,
-        feat_idx: Optional[list] = None,
+        is_decoding: bool = False,
         deterministic: bool = True,
     ):
         """
         Forward pass of the ResNet block.
         
-        支持两种缓存模式：
-        1. conv_cache: 旧模式（保持兼容性）
-        2. feat_cache/feat_idx: 新模式（逐帧解码）
-        
         Args:
             inputs: Input tensor (B, T, H, W, C)
             temb: Time embedding (B, temb_channels)
             zq: Spatial conditioning (for decoder)
-            conv_cache: 旧模式的缓存字典
-            feat_cache: 新模式的缓存列表
-            feat_idx: 新模式的索引列表
+            is_decoding: 是否在逐帧解码模式
             deterministic: Whether to use dropout
             
         Returns:
-            Output tensor and updated cache (或 None)
+            Output tensor
         """
-        # 新模式：使用 feat_cache/feat_idx
-        if feat_cache is not None and feat_idx is not None:
-            return self._call_with_feat_cache(inputs, temb, zq, feat_cache, feat_idx, deterministic)
-        
-        # 旧模式：使用 conv_cache
-        return self._call_with_conv_cache(inputs, temb, zq, conv_cache, deterministic)
-    
-    def _call_with_feat_cache(
-        self,
-        inputs: jnp.ndarray,
-        temb: Optional[jnp.ndarray],
-        zq: Optional[jnp.ndarray],
-        feat_cache: list,
-        feat_idx: list,
-        deterministic: bool,
-    ):
-        """新缓存模式的实现"""
         hidden_states = inputs
         
         # First norm and conv
         if zq is not None:
-            hidden_states, _ = self.norm1(hidden_states, zq, feat_cache=feat_cache, feat_idx=feat_idx)
+            hidden_states = self.norm1(hidden_states, zq, is_decoding=is_decoding)
         else:
             hidden_states = self.norm1(hidden_states)
         
         hidden_states = jax.nn.silu(hidden_states)
-        hidden_states, _ = self.conv1(hidden_states, feat_cache=feat_cache, feat_idx=feat_idx)
+        hidden_states = self.conv1(hidden_states, is_decoding=is_decoding)
         
         # Time embedding
         if temb is not None and self.temb_proj is not None:
@@ -891,7 +712,7 @@ class FlaxCogVideoXResnetBlock3D(nnx.Module):
         
         # Second norm and conv
         if zq is not None:
-            hidden_states, _ = self.norm2(hidden_states, zq, feat_cache=feat_cache, feat_idx=feat_idx)
+            hidden_states = self.norm2(hidden_states, zq, is_decoding=is_decoding)
         else:
             hidden_states = self.norm2(hidden_states)
         
@@ -901,83 +722,19 @@ class FlaxCogVideoXResnetBlock3D(nnx.Module):
         if self.dropout_rate > 0 and not deterministic:
             hidden_states = nnx.Dropout(rate=self.dropout_rate)(hidden_states)
         
-        hidden_states, _ = self.conv2(hidden_states, feat_cache=feat_cache, feat_idx=feat_idx)
+        hidden_states = self.conv2(hidden_states, is_decoding=is_decoding)
         
         # Shortcut
         if self.conv_shortcut is not None:
             if self.use_conv_shortcut:
-                inputs, _ = self.conv_shortcut(inputs, feat_cache=feat_cache, feat_idx=feat_idx)
+                inputs = self.conv_shortcut(inputs, is_decoding=is_decoding)
             else:
                 inputs = self.conv_shortcut(inputs)
         
         # Residual connection
         hidden_states = hidden_states + inputs
         
-        return hidden_states, None
-    
-    def _call_with_conv_cache(
-        self,
-        inputs: jnp.ndarray,
-        temb: Optional[jnp.ndarray],
-        zq: Optional[jnp.ndarray],
-        conv_cache: Optional[Dict[str, jnp.ndarray]],
-        deterministic: bool,
-    ):
-        """旧缓存模式的实现"""
-        new_conv_cache = {}
-        conv_cache = conv_cache or {}
-        
-        hidden_states = inputs
-        
-        # First norm and conv
-        if zq is not None:
-            hidden_states, new_conv_cache["norm1"] = self.norm1(
-                hidden_states, zq, conv_cache=conv_cache.get("norm1")
-            )
-        else:
-            hidden_states = self.norm1(hidden_states)
-        
-        hidden_states = jax.nn.silu(hidden_states)
-        hidden_states, new_conv_cache["conv1"] = self.conv1(
-            hidden_states, conv_cache=conv_cache.get("conv1")
-        )
-        
-        # Time embedding
-        if temb is not None and self.temb_proj is not None:
-            temb_proj = self.temb_proj(jax.nn.silu(temb))
-            hidden_states = hidden_states + temb_proj[:, None, None, None, :]
-        
-        # Second norm and conv
-        if zq is not None:
-            hidden_states, new_conv_cache["norm2"] = self.norm2(
-                hidden_states, zq, conv_cache=conv_cache.get("norm2")
-            )
-        else:
-            hidden_states = self.norm2(hidden_states)
-        
-        hidden_states = jax.nn.silu(hidden_states)
-        
-        # Dropout
-        if self.dropout_rate > 0 and not deterministic:
-            hidden_states = nnx.Dropout(rate=self.dropout_rate)(hidden_states)
-        
-        hidden_states, new_conv_cache["conv2"] = self.conv2(
-            hidden_states, conv_cache=conv_cache.get("conv2")
-        )
-        
-        # Shortcut
-        if self.conv_shortcut is not None:
-            if self.use_conv_shortcut:
-                inputs, new_conv_cache["conv_shortcut"] = self.conv_shortcut(
-                    inputs, conv_cache=conv_cache.get("conv_shortcut")
-                )
-            else:
-                inputs = self.conv_shortcut(inputs)
-        
-        # Residual connection
-        hidden_states = hidden_states + inputs
-        
-        return hidden_states, new_conv_cache
+        return hidden_states
 
 
 class FlaxCogVideoXDownBlock3D(nnx.Module):
@@ -1151,39 +908,27 @@ class FlaxCogVideoXMidBlock3D(nnx.Module):
         hidden_states: jnp.ndarray,
         temb: Optional[jnp.ndarray] = None,
         zq: Optional[jnp.ndarray] = None,
-        conv_cache: Optional[Dict[str, jnp.ndarray]] = None,
-        feat_cache: Optional[list] = None,
-        feat_idx: Optional[list] = None,
+        is_decoding: bool = False,
         deterministic: bool = True,
     ):
         """
         MidBlock forward pass.
         
-        支持两种缓存模式：
-        1. conv_cache: 旧模式（保持兼容性）
-        2. feat_cache/feat_idx: 新模式（逐帧解码）
+        Args:
+            hidden_states: Input tensor
+            temb: Time embedding
+            zq: Spatial conditioning
+            is_decoding: 是否在逐帧解码模式
+            deterministic: Whether to use dropout
         """
-        # 新模式：使用 feat_cache/feat_idx
-        if feat_cache is not None and feat_idx is not None:
-            for resnet in self.resnets:
-                hidden_states, _ = resnet(
-                    hidden_states, temb, zq,
-                    feat_cache=feat_cache, feat_idx=feat_idx,
-                    deterministic=deterministic
-                )
-            return hidden_states, None
-        
-        # 旧模式：使用 conv_cache
-        new_conv_cache = {}
-        conv_cache = conv_cache or {}
-        
-        for i, resnet in enumerate(self.resnets):
-            conv_cache_key = f"resnet_{i}"
-            hidden_states, new_conv_cache[conv_cache_key] = resnet(
-                hidden_states, temb, zq, conv_cache=conv_cache.get(conv_cache_key), deterministic=deterministic
+        for resnet in self.resnets:
+            hidden_states = resnet(
+                hidden_states, temb, zq,
+                is_decoding=is_decoding,
+                deterministic=deterministic
             )
         
-        return hidden_states, new_conv_cache
+        return hidden_states
 
 
 class FlaxCogVideoXUpBlock3D(nnx.Module):
@@ -1248,143 +993,58 @@ class FlaxCogVideoXUpBlock3D(nnx.Module):
         hidden_states: jnp.ndarray,
         temb: Optional[jnp.ndarray] = None,
         zq: Optional[jnp.ndarray] = None,
-        conv_cache: Optional[Dict[str, jnp.ndarray]] = None,
-        feat_cache: Optional[list] = None,
-        feat_idx: Optional[list] = None,
+        is_decoding: bool = False,
         deterministic: bool = True,
     ):
-        # 新模式：使用 feat_cache/feat_idx（逐帧解码）
-        if feat_cache is not None and feat_idx is not None:
-            for resnet in self.resnets:
-                hidden_states, _ = resnet(
-                    hidden_states, temb, zq,
-                    feat_cache=feat_cache, feat_idx=feat_idx,
-                    deterministic=deterministic
-                )
-            
-            if self.upsamplers is not None:
-                for upsampler in self.upsamplers:
-                    B, T, H, W, C = hidden_states.shape
-                    
-                    # compress_time：时间 + 空间上采样
-                    if self.compress_time:
-                        # 逐帧输入 T=1：1 -> 2（时间）+ 2x空间
-                        if T == 1:
-                            hidden_states = jax.image.resize(hidden_states, (B, 2, H * 2, W * 2, C), method='nearest')
-                        elif T > 1 and T % 2 == 1:
-                            first_frame = hidden_states[:, 0, :, :, :]
-                            rest_frames = hidden_states[:, 1:, :, :, :]
-                            first_frame = jax.image.resize(first_frame, (B, H * 2, W * 2, C), method='nearest')
-                            first_frame = first_frame[:, None, :, :, :]
-                            rest_frames = jax.image.resize(rest_frames, (B, 2 * (T-1), H * 2, W * 2, C), method='nearest')
-                            hidden_states = jnp.concatenate([first_frame, rest_frames], axis=1)
-                        else:
-                            hidden_states = jax.image.resize(hidden_states, (B, T * 2, H * 2, W * 2, C), method='nearest')
-                    else:
-                        # 非 compress_time：只做空间上采样
-                        hidden_states = hidden_states.reshape(B * T, H, W, C)
-                        hidden_states = jax.image.resize(hidden_states, (B * T, H * 2, W * 2, C), method='nearest')
-                        hidden_states = hidden_states.reshape(B, T, H * 2, W * 2, C)
-                    
-                    # 应用 2D 卷积到空间维度
-                    B, T_new, H_new, W_new, C = hidden_states.shape
-                    hidden_states = hidden_states.reshape(B * T_new, H_new, W_new, C)
-                    hidden_states = upsampler(hidden_states)
-                    _, H_final, W_final, _ = hidden_states.shape
-                    hidden_states = hidden_states.reshape(B, T_new, H_final, W_final, C)
-            
-            return hidden_states, None
+        """
+        UpBlock forward pass.
         
-        # 旧模式：使用 conv_cache
-        new_conv_cache = {}
-        conv_cache = conv_cache or {}
-        
-        for i, resnet in enumerate(self.resnets):
-            conv_cache_key = f"resnet_{i}"
-            hidden_states, new_conv_cache[conv_cache_key] = resnet(
-                hidden_states, temb, zq, conv_cache=conv_cache.get(conv_cache_key), deterministic=deterministic
+        Args:
+            hidden_states: Input tensor
+            temb: Time embedding
+            zq: Spatial conditioning
+            is_decoding: 是否在逐帧解码模式
+            deterministic: Whether to use dropout
+        """
+        for resnet in self.resnets:
+            hidden_states = resnet(
+                hidden_states, temb, zq,
+                is_decoding=is_decoding,
+                deterministic=deterministic
             )
         
         if self.upsamplers is not None:
             for upsampler in self.upsamplers:
                 B, T, H, W, C = hidden_states.shape
                 
-                # Match PyTorch's CogVideoXUpsample3D behavior
+                # compress_time：时间 + 空间上采样
                 if self.compress_time:
-                    # PyTorch uses F.interpolate which interpolates ALL dimensions
-                    # For compress_time, we need 2x upsampling in both time AND space
-                    if T > 1 and T % 2 == 1:
-                        # Odd frames: split first frame from rest
-                        # PyTorch: x_first, x_rest = inputs[:, :, 0], inputs[:, :, 1:]
-                        first_frame = hidden_states[:, 0, :, :, :]  # (B, H, W, C)
-                        rest_frames = hidden_states[:, 1:, :, :, :]  # (B, T-1, H, W, C)
-                        
-                        # Upsample first frame spatially only (no time dimension)
-                        # PyTorch: x_first = F.interpolate(x_first, scale_factor=2.0)
-                        first_frame = jax.image.resize(
-                            first_frame,
-                            (B, H * 2, W * 2, C),
-                            method='nearest'
-                        )
-                        first_frame = first_frame[:, None, :, :, :]  # Add time dim back
-                        
-                        # Upsample rest frames (both time and space)
-                        # PyTorch: x_rest = F.interpolate(x_rest, scale_factor=2.0)
-                        # This is 3D interpolation: (B, C, T-1, H, W) -> (B, C, 2*(T-1), 2*H, 2*W)
-                        # In JAX format: (B, T-1, H, W, C) -> (B, 2*(T-1), 2*H, 2*W, C)
-                        rest_frames = jax.image.resize(
-                            rest_frames,
-                            (B, 2 * (T-1), H * 2, W * 2, C),
-                            method='nearest'
-                        )
-                        
-                        # Concatenate: (B, 1, H*2, W*2, C) + (B, 2*(T-1), H*2, W*2, C)
-                        # Result: (B, 1+2*(T-1), H*2, W*2, C) = (B, 2*T-1, H*2, W*2, C)
+                    # 逐帧输入 T=1：1 -> 2（时间）+ 2x空间
+                    if T == 1:
+                        hidden_states = jax.image.resize(hidden_states, (B, 2, H * 2, W * 2, C), method='nearest')
+                    elif T > 1 and T % 2 == 1:
+                        first_frame = hidden_states[:, 0, :, :, :]
+                        rest_frames = hidden_states[:, 1:, :, :, :]
+                        first_frame = jax.image.resize(first_frame, (B, H * 2, W * 2, C), method='nearest')
+                        first_frame = first_frame[:, None, :, :, :]
+                        rest_frames = jax.image.resize(rest_frames, (B, 2 * (T-1), H * 2, W * 2, C), method='nearest')
                         hidden_states = jnp.concatenate([first_frame, rest_frames], axis=1)
-                    elif T > 1:
-                        # Even frames: regular 3D interpolation
-                        # PyTorch: inputs = F.interpolate(inputs, scale_factor=2.0)
-                        # (B, T, H, W, C) -> (B, 2*T, 2*H, 2*W, C)
-                        hidden_states = jax.image.resize(
-                            hidden_states,
-                            (B, T * 2, H * 2, W * 2, C),
-                            method='nearest'
-                        )
                     else:
-                        # Single frame with compress_time: upsample to 2 frames AND spatial 2x
-                        # 输入: (B, 1, H, W, C) → 输出: (B, 2, H*2, W*2, C)
-                        # 使用 jax.image.resize 同时对时间和空间维度进行上采样
-                        hidden_states = jax.image.resize(
-                            hidden_states,
-                            (B, 2, H * 2, W * 2, C),  # 时间维度 1→2，空间维度 2x
-                            method='nearest'
-                        )
+                        hidden_states = jax.image.resize(hidden_states, (B, T * 2, H * 2, W * 2, C), method='nearest')
                 else:
-                    # Only interpolate spatial dimensions (2D)
-                    # Combine batch and time for processing
+                    # 非 compress_time：只做空间上采样
                     hidden_states = hidden_states.reshape(B * T, H, W, C)
-                    
-                    # Nearest neighbor upsampling 2x spatial only
-                    hidden_states = jax.image.resize(
-                        hidden_states,
-                        (B * T, H * 2, W * 2, C),
-                        method='nearest'
-                    )
-                    
-                    # Reshape back to 5D
+                    hidden_states = jax.image.resize(hidden_states, (B * T, H * 2, W * 2, C), method='nearest')
                     hidden_states = hidden_states.reshape(B, T, H * 2, W * 2, C)
                 
-                # Apply 2D convolution on spatial dimensions
-                # Reshape: (B, T, H', W', C) → (B*T, H', W', C)
+                # 应用 2D 卷积到空间维度
                 B, T_new, H_new, W_new, C = hidden_states.shape
                 hidden_states = hidden_states.reshape(B * T_new, H_new, W_new, C)
                 hidden_states = upsampler(hidden_states)
-                
-                # Reshape back: (B*T, H', W', C) → (B, T, H', W', C)
                 _, H_final, W_final, _ = hidden_states.shape
                 hidden_states = hidden_states.reshape(B, T_new, H_final, W_final, C)
         
-        return hidden_states, new_conv_cache
+        return hidden_states
 
 
 class FlaxCogVideoXEncoder3D(nnx.Module):
@@ -1618,133 +1278,54 @@ class FlaxCogVideoXDecoder3D(nnx.Module):
         sample: jnp.ndarray,
         zq: jnp.ndarray,
         temb: Optional[jnp.ndarray] = None,
-        conv_cache: Optional[Dict[str, jnp.ndarray]] = None,
-        feat_cache: Optional[list] = None,
-        feat_idx: Optional[list] = None,
+        is_decoding: bool = False,
         deterministic: bool = True,
     ):
         """
         Decoder forward pass.
         
-        支持两种缓存模式：
-        1. conv_cache: 旧模式（保持兼容性）
-        2. feat_cache/feat_idx: 新模式（逐帧解码）
-        
         Args:
             sample: Latent representation (B, T, H, W, C)
             zq: Spatial conditioning (same as sample for CogVideoX)
             temb: Time embedding (optional)
-            conv_cache: 旧模式的缓存字典
-            feat_cache: 新模式的缓存列表
-            feat_idx: 新模式的索引列表
+            is_decoding: 是否在逐帧解码模式
             deterministic: Whether to use dropout
         """
-        # 新模式：使用 feat_cache/feat_idx
-        if feat_cache is not None and feat_idx is not None:
-            # Input conv
-            hidden_states, _ = self.conv_in(sample, feat_cache=feat_cache, feat_idx=feat_idx)
-            
-            # Mid block
-            hidden_states, _ = self.mid_block(
-                hidden_states, temb, sample,
-                feat_cache=feat_cache, feat_idx=feat_idx,
-                deterministic=deterministic
-            )
-            
-            # Up blocks
-            for i, up_block in enumerate(self.up_blocks):
-                hidden_states, _ = up_block(
-                    hidden_states, temb, sample,
-                    feat_cache=feat_cache, feat_idx=feat_idx,
-                    deterministic=deterministic
-                )
-            
-            # Output
-            hidden_states, _ = self.norm_out(hidden_states, sample, feat_cache=feat_cache, feat_idx=feat_idx)
-            hidden_states = jax.nn.silu(hidden_states)
-            hidden_states, _ = self.conv_out(hidden_states, feat_cache=feat_cache, feat_idx=feat_idx)
-            
-            return hidden_states, None
-        
-        # 旧模式：使用 conv_cache
-        new_conv_cache = {}
-        conv_cache = conv_cache or {}
-        
         # Input conv
-        hidden_states, new_conv_cache["conv_in"] = self.conv_in(
-            sample, conv_cache=conv_cache.get("conv_in")
-        )
+        hidden_states = self.conv_in(sample, is_decoding=is_decoding)
         
         # Mid block
-        hidden_states, new_conv_cache["mid_block"] = self.mid_block(
-            hidden_states, temb, sample, conv_cache=conv_cache.get("mid_block"), deterministic=deterministic
+        hidden_states = self.mid_block(
+            hidden_states, temb, sample,
+            is_decoding=is_decoding,
+            deterministic=deterministic
         )
         
         # Up blocks
-        for i, up_block in enumerate(self.up_blocks):
-            conv_cache_key = f"up_block_{i}"
-            hidden_states, new_conv_cache[conv_cache_key] = up_block(
-                hidden_states, temb, sample, conv_cache=conv_cache.get(conv_cache_key), deterministic=deterministic
+        for up_block in self.up_blocks:
+            hidden_states = up_block(
+                hidden_states, temb, sample,
+                is_decoding=is_decoding,
+                deterministic=deterministic
             )
         
         # Output
-        hidden_states, new_conv_cache["norm_out"] = self.norm_out(
-            hidden_states, sample, conv_cache=conv_cache.get("norm_out")
-        )
+        hidden_states = self.norm_out(hidden_states, sample, is_decoding=is_decoding)
         hidden_states = jax.nn.silu(hidden_states)
-        hidden_states, new_conv_cache["conv_out"] = self.conv_out(
-            hidden_states, conv_cache=conv_cache.get("conv_out")
-        )
+        hidden_states = self.conv_out(hidden_states, is_decoding=is_decoding)
         
-        return hidden_states, new_conv_cache
+        return hidden_states
+    
+    def reset_caching_state(self):
+        """重置解码器中所有 CausalConv3d 层的缓存状态"""
+        # 遍历解码器的所有子模块
+        for _, module in nnx.graph.iter_graph(self):
+            # 如果发现了我们定义的缓存变量，就把它重置为 None
+            if isinstance(module, DecodeCache):
+                module.value = None
 
 
 # Continued in next part...
-
-class FlaxCogVideoXCache:
-    """
-    缓存管理类，用于逐帧解码时存储 CausalConv3d 层的中间结果。
-    
-    基于 AutoencoderKLWanCache 的设计，但针对 CogVideoX 的结构优化。
-    这个缓存允许我们逐帧处理 decoder，避免一次性加载所有帧导致 OOM。
-    """
-    
-    def __init__(self, decoder_module):
-        """
-        初始化缓存。
-        
-        Args:
-            decoder_module: FlaxCogVideoXDecoder3D 实例
-        """
-        self.decoder_module = decoder_module
-        self.clear_cache()
-    
-    def clear_cache(self):
-        """重置所有缓存和索引"""
-        # 计算 decoder 中有多少个 CausalConv3d 层
-        self._conv_num = self._count_causal_conv3d(self.decoder_module)
-        self._conv_idx = [0]  # 使用列表以便在函数间传递引用
-        self._feat_map = [None] * self._conv_num
-    
-    @staticmethod
-    def _count_causal_conv3d(module):
-        """
-        递归计算模块中 FlaxCogVideoXCausalConv3d 层的数量。
-        
-        Args:
-            module: nnx.Module 实例
-            
-        Returns:
-            int: CausalConv3d 层的数量
-        """
-        count = 0
-        # 使用 nnx.graph.iter_graph 遍历所有子模块
-        node_types = nnx.graph.iter_graph([module])
-        for _, value in node_types:
-            if isinstance(value, FlaxCogVideoXCausalConv3d):
-                count += 1
-        return count
-
 
 class FlaxAutoencoderKLCogVideoX(nnx.Module):
     """
@@ -1954,10 +1535,9 @@ class FlaxAutoencoderKLCogVideoX(nnx.Module):
     
     def _decode(self, z: jnp.ndarray, zq: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
         """
-        Internal decode with frame-by-frame processing using feat_cache.
+        Internal decode with frame-by-frame processing using internal JAX state.
         
-        这是参考 WAN VAE 的逐帧解码实现，通过 FlaxCogVideoXCache 管理所有 CausalConv3d 层的缓存。
-        每个 latent 帧独立处理并上采样到 temporal_compression_ratio 倍的视频帧。
+        使用内部 JAX 状态进行逐帧解码，配合 JIT 加速。
         
         Args:
             z: Latent representation (B, T, H, W, C)
@@ -1967,105 +1547,39 @@ class FlaxAutoencoderKLCogVideoX(nnx.Module):
         Returns:
             Decoded video (B, T*temporal_compression_ratio, H, W, C)
         """
-        import os
-        
-        # 内存监控开关（通过环境变量控制）
-        # 使用方法: export JAX_MEMORY_DEBUG=1
-        enable_memory_debug = os.getenv('JAX_MEMORY_DEBUG', '0') == '1'
-        
-        def get_memory_stats():
-            """获取当前设备内存统计信息"""
-            if not enable_memory_debug:
-                return ""
-            try:
-                # 获取所有设备的内存统计
-                for device in jax.devices():
-                    stats = device.memory_stats()
-                    if stats:
-                        used_gb = stats.get('bytes_in_use', 0) / 1e9
-                        limit_gb = stats.get('bytes_limit', 0) / 1e9
-                        return f"{used_gb:.2f}GB / {limit_gb:.2f}GB"
-            except:
-                pass
-            return "N/A"
-        
-        def log_memory(msg):
-            """记录内存状态（仅在开启调试时）"""
-            if enable_memory_debug:
-                print(f"[内存] {msg}: {get_memory_stats()}")
-        
         batch_size, num_frames, height, width, num_channels = z.shape
-        
-        if enable_memory_debug:
-            print(f"\n[VAE Decode] 开始解码: {num_frames} latent frames -> {num_frames * 4} video frames")
-        log_memory("解码前")
         
         if self.use_tiling and (width > self.tile_latent_min_width or height > self.tile_latent_min_height):
             return self.tiled_decode(z, zq, deterministic=deterministic)
         
-        # 创建缓存管理器（参考 WAN 的 _decode 实现）
-        # 重要：每次调用都创建全新的缓存，避免内存泄漏
-        feat_cache_manager = FlaxCogVideoXCache(self.decoder)
-        log_memory("创建缓存管理器后")
+        # 1. 【重要】开始前重置缓存！
+        self.decoder.reset_caching_state()
         
         # 应用 post_quant_conv 到整个 latent（如果存在）
         if self.post_quant_conv is not None:
             z = self.post_quant_conv(z)
-            log_memory("post_quant_conv 后")
         
-        # 逐帧解码（缓存共享，每帧只重置索引）
+        # 2. 逐帧解码（不使用 JIT，避免内存峰值）
+        # 使用内部状态管理缓存，应该比外部 Python 列表更高效
         decoded_frames_list = []
         
-        try:
-            for i in range(num_frames):
-                # 每帧重置索引（不清空缓存，保持帧间连续性）
-                feat_cache_manager._conv_idx = [0]
-                
-                # 提取当前 latent 帧
-                z_frame = z[:, i:i+1, :, :, :]
-                zq_frame = zq[:, i:i+1, :, :, :]
-                
-                # 使用共享缓存解码当前帧
-                # 每个 latent 帧会被上采样到 temporal_compression_ratio 倍的视频帧 (通常是 4 帧)
-                decoded_frame, _ = self.decoder(
-                    z_frame, zq_frame,
-                    feat_cache=feat_cache_manager._feat_map,
-                    feat_idx=feat_cache_manager._conv_idx,
-                    deterministic=deterministic
-                )
-                
-                # 直接添加解码结果
-                # CogVideoX 使用 jax.image.resize 进行时序上采样，不需要帧顺序修正
-                decoded_frames_list.append(decoded_frame)
-                
-                # 每 8 帧打印一次内存状态
-                if enable_memory_debug and ((i + 1) % 8 == 0 or i == 0):
-                    log_memory(f"解码第 {i+1}/{num_frames} 帧后")
+        for i in range(num_frames):
+            z_f = z[:, i:i+1]
+            zq_f = zq[:, i:i+1]
             
-            log_memory("所有帧解码完成，准备拼接")
-            
-            # 拼接所有解码后的帧
-            decoded = jnp.concatenate(decoded_frames_list, axis=1)
-            log_memory("拼接完成")
-            
-            decoded = jnp.clip(decoded, min=-1.0, max=1.0)
-            log_memory("clip 完成")
-            
-            return decoded
-        finally:
-            log_memory("开始清理缓存")
-            
-            # 显式清理所有缓存和中间变量
-            for i in range(len(feat_cache_manager._feat_map)):
-                feat_cache_manager._feat_map[i] = None
-            feat_cache_manager._feat_map = None
-            feat_cache_manager._conv_idx = None
-            del feat_cache_manager
-            decoded_frames_list = None
-            
-            log_memory("清理缓存完成")
-            if enable_memory_debug:
-                print(f"[内存] 解码结束\n")
+            # 直接调用解码器，使用 is_decoding=True 激活内部缓存
+            decoded_frame = self.decoder(
+                z_f,
+                zq=zq_f,
+                temb=None,
+                is_decoding=True,
+                deterministic=deterministic
+            )
+            decoded_frames_list.append(decoded_frame)
+        
+        # 3. 拼接结果
+        decoded = jnp.concatenate(decoded_frames_list, axis=1)
+        return decoded
     
     def decode(self, z: jnp.ndarray, zq: Optional[jnp.ndarray] = None, deterministic: bool = True) -> jnp.ndarray:
         """
@@ -2424,10 +1938,32 @@ class FlaxAutoencoderKLCogVideoX(nnx.Module):
         nested_weights = unflatten_dict(jax_weights, sep=".")
         
         # Load weights into model
-        graphdef, _ = nnx.split(model)
-        model = nnx.merge(graphdef, nested_weights)
+        # 使用 update 而不是 merge，这样可以只更新存在的权重
+        # 而不要求权重数量完全匹配（因为我们新增了 DecodeCache 状态）
+        graphdef, state = nnx.split(model)
+        
+        # 递归更新状态，只更新存在于 nested_weights 中的参数
+        def update_state(target_state, source_weights, path=""):
+            for key, value in source_weights.items():
+                full_path = f"{path}.{key}" if path else key
+                if key in target_state:
+                    if isinstance(value, dict) and hasattr(target_state[key], '__dict__'):
+                        # 递归更新嵌套结构
+                        update_state(target_state[key].__dict__, value, full_path)
+                    elif isinstance(value, dict):
+                        update_state(target_state[key], value, full_path)
+                    else:
+                        # 直接更新叶子节点
+                        if hasattr(target_state[key], 'value'):
+                            target_state[key].value = value
+                        else:
+                            target_state[key] = value
+        
+        update_state(state, nested_weights)
+        model = nnx.merge(graphdef, state)
         
         print(f"✓ 模型加载完成!")
         print(f"  配置: {config}")
+        print(f"  注意: DecodeCache 状态已初始化为 None（将在首次解码时自动填充）")
         
         return model
