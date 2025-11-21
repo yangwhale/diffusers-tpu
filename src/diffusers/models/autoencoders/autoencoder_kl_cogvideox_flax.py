@@ -396,6 +396,25 @@ class FlaxCogVideoXCausalConv3d(nnx.Module):
         
         return output, new_cache
 
+# 由于 nnx.GroupNorm 使用了 lax.square 导致内存占用过高，所以这里自定义实现一个更内存高效的版本。
+# 留下这个注释以备参考
+# class FlaxGroupNorm(nnx.GroupNorm):
+#     """
+#     Wrapper around nnx.GroupNorm to match the parameter signature of the original FlaxGroupNorm.
+#     """
+#     def __init__(
+#         self,
+#         num_groups: int,
+#         num_channels: int,
+#         epsilon: float = 1e-6,
+#         rngs: nnx.Rngs = None,
+#     ):
+#         super().__init__(
+#             num_features=num_channels,
+#             num_groups=num_groups,
+#             epsilon=epsilon,
+#             rngs=rngs
+#         )
 
 class FlaxGroupNorm(nnx.Module):
     """
