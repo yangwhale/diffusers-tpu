@@ -438,7 +438,6 @@ def get_global_mesh() -> Mesh:
     return _GLOBAL_MESH
 
 
-@functools.lru_cache(maxsize=32)
 def _create_splash_attention_kernel(padded_q_seq_len, padded_kv_seq_len, num_heads_on_device, window_size=None):
     """创建 Splash attention kernel"""
     if window_size is not None:
@@ -490,8 +489,8 @@ def _tpu_splash_attention_single_device(query, key, value, scale=None, use_k_smo
         k_3d_padded, _ = pad_to_multiple(k_3d, BKVSIZE, axis=1)
         v_3d_padded, _ = pad_to_multiple(v_3d, BKVSIZE, axis=1)
 
-        padded_q_seq_len = q_3d_padded.shape[1]
-        padded_kv_seq_len = k_3d_padded.shape[1]
+        padded_q_seq_len = int(q_3d_padded.shape[1])
+        padded_kv_seq_len = int(k_3d_padded.shape[1])
 
         # 创建并执行 Splash attention kernel
         splash_kernel = _create_splash_attention_kernel(
@@ -508,20 +507,26 @@ def _tpu_splash_attention_single_device(query, key, value, scale=None, use_k_smo
 
 
 def _tpu_splash_attention_sharded(query, key, value, mesh, scale=None, use_k_smooth=True):
-    """TPU Splash Attention 实现（多设备分片版本）"""
+    """TPU Splash Attention 实现（多设备分片版本）
     
-    # 可选的 K-smooth 处理
+    使用 shard_map 在多设备间分片执行 Splash Attention。
+    注意：不使用 lru_cache 缓存 kernel，以避免 tracer leak。
+    """
+    
+    # 可选的 K-smooth 处理（在 shard_map 外部执行）
     if use_k_smooth:
         key_mean = jnp.mean(key, axis=2, keepdims=True)
         key = key - key_mean
 
+    # 缩放 query 张量（在 shard_map 外部执行）
+    scale_factor = 1.0 / math.sqrt(query.shape[-1]) if scale is None else scale
+    query = query * scale_factor
+
     num_heads = query.shape[1]
 
     def _attention_on_slices(q, k, v):
-        # 缩放 query 张量
-        scale_factor = 1.0 / math.sqrt(q.shape[-1]) if scale is None else scale
-        q = q * scale_factor
-
+        """在单个设备切片上执行 attention"""
+        
         def pad_to_multiple(x, multiple, axis):
             seq_len = x.shape[axis]
             pad_len = (multiple - seq_len % multiple) % multiple
@@ -542,9 +547,20 @@ def _tpu_splash_attention_sharded(query, key, value, mesh, scale=None, use_k_smo
             padded_q_seq_len = q_3d_padded.shape[1]
             padded_kv_seq_len = k_3d_padded.shape[1]
 
-            # 创建并执行 Splash attention kernel
-            splash_kernel = _create_splash_attention_kernel(
-                padded_q_seq_len, padded_kv_seq_len, num_heads_on_device, window_size=None
+            # 直接创建 mask 和 kernel（不使用缓存）
+            mask = splash_attention.MultiHeadMask(
+                [splash_attention.FullMask((padded_q_seq_len, padded_kv_seq_len))
+                 for _ in range(num_heads_on_device)]
+            )
+            
+            block_sizes = splash_attention.BlockSizes(
+                block_q=min(BQSIZE, padded_q_seq_len),
+                block_kv=min(BKVSIZE, padded_kv_seq_len),
+                block_kv_compute=min(BKVCOMPUTESIZE, padded_kv_seq_len),
+            )
+            
+            splash_kernel = splash_attention.make_splash_mha(
+                mask=mask, block_sizes=block_sizes, head_shards=1, q_seq_shards=1
             )
             out = splash_kernel(q_3d_padded, k_3d_padded, v_3d_padded)
             
@@ -583,7 +599,7 @@ def _tpu_splash_attention_sharded(query, key, value, mesh, scale=None, use_k_smo
 def _tpu_splash_attention(query, key, value, scale=None, use_k_smooth=True):
     """TPU Splash Attention 统一入口
     
-    自动根据全局 mesh 配置选择单设备或多设备分片版本
+    自动根据全局 mesh 配置选择单设备或多设备分片版本。
     """
     mesh = get_global_mesh()
     
