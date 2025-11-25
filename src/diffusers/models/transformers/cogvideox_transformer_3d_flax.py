@@ -29,7 +29,7 @@ import math
 import functools
 from jax.experimental.pallas.ops.tpu import splash_attention
 from jax.experimental.shard_map import shard_map
-from jax.sharding import Mesh
+from jax.sharding import PartitionSpec as P, Mesh
 
 
 @dataclass
@@ -425,6 +425,18 @@ BKVSIZE = 2048
 BKVCOMPUTESIZE = 1024
 USE_K_SMOOTH = True
 
+# 全局 mesh 变量，用于多设备分片
+_GLOBAL_MESH = None
+
+def set_global_mesh(mesh: Mesh):
+    """设置全局 mesh，用于多设备分片"""
+    global _GLOBAL_MESH
+    _GLOBAL_MESH = mesh
+
+def get_global_mesh() -> Mesh:
+    """获取全局 mesh"""
+    return _GLOBAL_MESH
+
 
 @functools.lru_cache(maxsize=32)
 def _create_splash_attention_kernel(padded_q_seq_len, padded_kv_seq_len, num_heads_on_device, window_size=None):
@@ -449,8 +461,8 @@ def _create_splash_attention_kernel(padded_q_seq_len, padded_kv_seq_len, num_hea
     )
 
 
-def _tpu_splash_attention(query, key, value, scale=None, use_k_smooth=True):
-    """TPU Splash Attention 实现（单设备优化版本）"""
+def _tpu_splash_attention_single_device(query, key, value, scale=None, use_k_smooth=True):
+    """TPU Splash Attention 实现（单设备版本）"""
     
     # 可选的 K-smooth 处理
     if use_k_smooth:
@@ -493,6 +505,94 @@ def _tpu_splash_attention(query, key, value, scale=None, use_k_smooth=True):
     # 在批次维度上映射 kernel
     vmapped_kernel = jax.vmap(kernel_3d, in_axes=(0, 0, 0), out_axes=0)
     return vmapped_kernel(query, key, value)
+
+
+def _tpu_splash_attention_sharded(query, key, value, mesh, scale=None, use_k_smooth=True):
+    """TPU Splash Attention 实现（多设备分片版本）"""
+    
+    # 可选的 K-smooth 处理
+    if use_k_smooth:
+        key_mean = jnp.mean(key, axis=2, keepdims=True)
+        key = key - key_mean
+
+    num_heads = query.shape[1]
+
+    def _attention_on_slices(q, k, v):
+        # 缩放 query 张量
+        scale_factor = 1.0 / math.sqrt(q.shape[-1]) if scale is None else scale
+        q = q * scale_factor
+
+        def pad_to_multiple(x, multiple, axis):
+            seq_len = x.shape[axis]
+            pad_len = (multiple - seq_len % multiple) % multiple
+            if pad_len == 0:
+                return x, seq_len
+            pad_width = [(0, 0)] * x.ndim
+            pad_width[axis] = (0, pad_len)
+            return jnp.pad(x, pad_width), seq_len
+
+        def kernel_3d(q_3d, k_3d, v_3d):
+            num_heads_on_device = q_3d.shape[0]
+
+            # 填充到块大小的倍数
+            q_3d_padded, q_orig_len = pad_to_multiple(q_3d, BQSIZE, axis=1)
+            k_3d_padded, _ = pad_to_multiple(k_3d, BKVSIZE, axis=1)
+            v_3d_padded, _ = pad_to_multiple(v_3d, BKVSIZE, axis=1)
+
+            padded_q_seq_len = q_3d_padded.shape[1]
+            padded_kv_seq_len = k_3d_padded.shape[1]
+
+            # 创建并执行 Splash attention kernel
+            splash_kernel = _create_splash_attention_kernel(
+                padded_q_seq_len, padded_kv_seq_len, num_heads_on_device, window_size=None
+            )
+            out = splash_kernel(q_3d_padded, k_3d_padded, v_3d_padded)
+            
+            # 移除填充
+            return out[:, :q_orig_len, ...]
+
+        # 在批次维度上映射 kernel
+        vmapped_kernel = jax.vmap(kernel_3d, in_axes=(0, 0, 0), out_axes=0)
+        return vmapped_kernel(q, k, v)
+
+    # 根据设备数量和头数确定分片策略
+    if num_heads < mesh.size:
+        q_partition_spec = P()
+        kv_partition_spec = P()
+    else:
+        if query.shape[2] == key.shape[2]:  # 自注意力
+            q_partition_spec = P('dp', 'tp', 'sp', None)
+            kv_partition_spec = P('dp', 'tp', None, None)
+        else:  # 交叉注意力
+            q_partition_spec = P('dp', None, ('tp', 'sp'), None)
+            kv_partition_spec = P('dp', None, None, None)
+
+    # 使用 shard_map 在设备间分片执行
+    sharded_fn = shard_map(
+        _attention_on_slices,
+        mesh=mesh,
+        in_specs=(q_partition_spec, kv_partition_spec, kv_partition_spec),
+        out_specs=q_partition_spec,
+        check_rep=False,
+    )
+    out = sharded_fn(query, key, value)
+    
+    return out
+
+
+def _tpu_splash_attention(query, key, value, scale=None, use_k_smooth=True):
+    """TPU Splash Attention 统一入口
+    
+    自动根据全局 mesh 配置选择单设备或多设备分片版本
+    """
+    mesh = get_global_mesh()
+    
+    if mesh is not None and mesh.size > 1:
+        # 多设备分片版本
+        return _tpu_splash_attention_sharded(query, key, value, mesh, scale=scale, use_k_smooth=use_k_smooth)
+    else:
+        # 单设备版本
+        return _tpu_splash_attention_single_device(query, key, value, scale=scale, use_k_smooth=use_k_smooth)
 
 
 class FlaxAttention(nnx.Module):
