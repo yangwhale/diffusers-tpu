@@ -662,6 +662,75 @@ class CogVideoXBlock(nn.Module):
         return hidden_states, encoder_hidden_states
 
 
+# ════════════════════════════════════════════════════════════════════════════════
+# Mixin 类详解 - Python 多重继承的设计模式
+# ════════════════════════════════════════════════════════════════════════════════
+#
+# 【什么是 Mixin？】
+#
+# Mixin 是一种 Python 设计模式，用于为类添加「可复用的功能模块」。
+#
+# 与普通继承的区别：
+# ┌─────────────────────────────────────────────────────────────────────────────────┐
+# │ 普通继承                              │ Mixin                                   │
+# ├─────────────────────────────────────────────────────────────────────────────────┤
+# │ class Dog(Animal):                   │ class Dog(Animal, Runnable, Trainable): │
+# │   - Dog「是」一种 Animal              │   - Dog「是」Animal                     │
+# │   - 单一继承，一条继承链              │   - Dog「能」Run（Mixin 功能）           │
+# │                                       │   - Dog「能」被 Train（Mixin 功能）      │
+# │                                       │   - 多重继承，组合多个功能               │
+# └─────────────────────────────────────────────────────────────────────────────────┘
+#
+# 【Mixin 的特点】
+#
+# 1. 功能单一：每个 Mixin 只提供一种特定功能
+# 2. 不独立使用：Mixin 不是设计来单独实例化的
+# 3. 无状态或少状态：主要提供方法，避免复杂的 __init__
+# 4. 可组合：多个 Mixin 可以自由组合
+# 5. 命名约定：类名以 Mixin 结尾（如 ModelMixin, ConfigMixin）
+#
+# 【为什么用 Mixin 而不是单继承？】
+#
+# 假设我们有 100 个不同的模型类：
+#
+# 方案 1：单继承（❌ 不好）
+# ────────────────────────────────────────────────────────────────────
+#     class BaseModel:
+#         def save_pretrained(self): ...
+#         def load_pretrained(self): ...
+#         def get_config(self): ...
+#         def save_config(self): ...
+#         def load_lora(self): ...
+#         def enable_cache(self): ...
+#         # ... 几十个方法
+#
+#     # 问题：所有模型都必须有所有功能，无法按需选择
+#
+# 方案 2：Mixin（✓ 好）
+# ────────────────────────────────────────────────────────────────────
+#     class ModelMixin:      # 只负责保存/加载模型
+#         def save_pretrained(self): ...
+#         def load_pretrained(self): ...
+#
+#     class ConfigMixin:     # 只负责配置管理
+#         def get_config(self): ...
+#         def save_config(self): ...
+#
+#     class PeftAdapterMixin:  # 只负责 LoRA
+#         def load_lora(self): ...
+#
+#     class CacheMixin:      # 只负责缓存
+#         def enable_cache(self): ...
+#
+#     # 按需组合！
+#     class Model1(ModelMixin, ConfigMixin):  # 只要保存和配置
+#         pass
+#
+#     class Model2(ModelMixin, ConfigMixin, PeftAdapterMixin):  # 还要 LoRA
+#         pass
+#
+# ════════════════════════════════════════════════════════════════════════════════
+
 class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, CacheMixin):
     """
     CogVideoX 3D Transformer 主模型 - 视频生成的核心。
@@ -669,7 +738,11 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Cac
     【与 Flax 版本的对应】
     对应 Flax 版本中的 FlaxCogVideoXTransformer3DModel 类。
     
-    【继承的 Mixin 类说明】
+    ═══════════════════════════════════════════════════════════════════════════
+    【继承的 Mixin 类详解】
+    ═══════════════════════════════════════════════════════════════════════════
+    
+    本类继承了 4 个 Mixin，下面逐一解释：
     
     ┌─────────────────────────────────────────────────────────────────────────────────┐
     │ Mixin 类                │ 功能                                                  │
@@ -679,6 +752,181 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Cac
     │ PeftAdapterMixin       │ LoRA/PEFT 适配器支持 (Flax 版本没有)                   │
     │ CacheMixin             │ KV Cache 支持，用于推理优化                            │
     └─────────────────────────────────────────────────────────────────────────────────┘
+    
+    ───────────────────────────────────────────────────────────────────────────
+    【1. ModelMixin】 - 模型保存/加载功能
+    ───────────────────────────────────────────────────────────────────────────
+    
+    提供的主要方法：
+    
+        model.save_pretrained("./my_model/")
+        ─────────────────────────────────────────────────────────────────
+        将模型权重保存到指定目录
+        会生成：
+        - diffusion_pytorch_model.safetensors (权重文件)
+        - 或 diffusion_pytorch_model.bin (旧格式)
+        
+        model = Model.from_pretrained("THUDM/CogVideoX-5b")
+        ─────────────────────────────────────────────────────────────────
+        从 HuggingFace Hub 或本地目录加载模型
+        自动处理：
+        - 权重下载
+        - 分片权重合并
+        - 设备放置
+        - dtype 转换
+        
+        model.to(device="cuda", dtype=torch.float16)
+        ─────────────────────────────────────────────────────────────────
+        移动模型到指定设备和数据类型
+        
+        model.num_parameters()
+        ─────────────────────────────────────────────────────────────────
+        返回模型参数量
+    
+    【为什么需要 ModelMixin？】
+    让所有 diffusers 模型有统一的保存/加载接口，
+    用户不需要学习每个模型不同的 API。
+    
+    ───────────────────────────────────────────────────────────────────────────
+    【2. ConfigMixin】 - 配置管理功能
+    ───────────────────────────────────────────────────────────────────────────
+    
+    提供的主要功能：
+    
+        @register_to_config 装饰器
+        ─────────────────────────────────────────────────────────────────
+        用在 __init__ 方法上，自动将所有参数保存到 self.config
+        
+        例如：
+            @register_to_config
+            def __init__(self, num_layers=30, num_heads=48):
+                ...
+        
+        之后可以通过 model.config.num_layers 访问参数值
+        
+        config = model.config
+        ─────────────────────────────────────────────────────────────────
+        获取模型配置，返回一个类似字典的对象
+        
+        model.save_config("./my_model/")
+        ─────────────────────────────────────────────────────────────────
+        保存配置到 config.json
+        
+        config = Model.load_config("./my_model/")
+        ─────────────────────────────────────────────────────────────────
+        加载配置，不加载权重
+    
+    【为什么需要 ConfigMixin？】
+    - 保证模型可复现：配置和权重一起保存
+    - 便于修改超参数：加载配置后可以调整再实例化
+    - 统一的配置格式：所有模型都用 JSON 配置
+    
+    ───────────────────────────────────────────────────────────────────────────
+    【3. PeftAdapterMixin】 - LoRA/PEFT 适配器支持
+    ───────────────────────────────────────────────────────────────────────────
+    
+    PEFT = Parameter-Efficient Fine-Tuning（参数高效微调）
+    LoRA = Low-Rank Adaptation（低秩适配）
+    
+    提供的主要方法：
+    
+        model.load_lora_weights("path/to/lora")
+        ─────────────────────────────────────────────────────────────────
+        加载预训练的 LoRA 权重
+        LoRA 只有几 MB，而原模型有几 GB
+        
+        model.set_adapters(["lora1", "lora2"], weights=[0.7, 0.3])
+        ─────────────────────────────────────────────────────────────────
+        同时使用多个 LoRA，并设置混合权重
+        
+        model.disable_lora()
+        model.enable_lora()
+        ─────────────────────────────────────────────────────────────────
+        临时禁用/启用 LoRA
+        
+        model.delete_adapters(["lora1"])
+        ─────────────────────────────────────────────────────────────────
+        删除已加载的 LoRA
+    
+    【LoRA 的原理简述】
+    
+    原始权重矩阵 W (如 4096 × 4096 = 16M 参数)
+    
+    LoRA 思路：
+    - 不修改原始 W
+    - 添加一个低秩矩阵 ΔW = A × B
+    - A: 4096 × 8 = 32K 参数
+    - B: 8 × 4096 = 32K 参数
+    - 总共只需要 64K 参数（原来的 0.4%）
+    
+    推理时：W_new = W + α × (A × B)
+    
+    【为什么 Flax 版本没有 PeftAdapterMixin？】
+    - PEFT 库主要为 PyTorch 设计
+    - TPU 生态中 LoRA 支持不如 GPU 成熟
+    - Flax 需要另外实现 LoRA 支持
+    
+    ───────────────────────────────────────────────────────────────────────────
+    【4. CacheMixin】 - KV Cache 缓存功能
+    ───────────────────────────────────────────────────────────────────────────
+    
+    KV Cache = Key-Value Cache（键值缓存）
+    
+    主要用于**自回归推理**（一次生成一个 token）：
+    
+    【没有 Cache 的问题】
+    
+        第 1 步：处理 "Hello"        → 计算 K, V
+        第 2 步：处理 "Hello world"  → 重新计算所有 K, V（包括 Hello 的）
+        第 3 步：处理 "Hello world !" → 又重新计算...
+        
+        浪费！"Hello" 的 K, V 被重复计算
+    
+    【有 Cache 的优化】
+    
+        第 1 步：处理 "Hello"        → 计算并缓存 K, V
+        第 2 步：处理 "world"        → 只计算新 token，复用缓存
+        第 3 步：处理 "!"           → 只计算新 token，复用缓存
+        
+        效率大增！
+    
+    提供的主要方法：
+    
+        model.enable_cache()
+        ─────────────────────────────────────────────────────────────────
+        启用 KV Cache
+        
+        model.disable_cache()
+        ─────────────────────────────────────────────────────────────────
+        禁用 KV Cache（训练时通常禁用）
+        
+        model.reset_cache()
+        ─────────────────────────────────────────────────────────────────
+        清空缓存（开始新序列时调用）
+    
+    【CogVideoX 中的 Cache 使用场景】
+    
+    虽然 CogVideoX 是 Diffusion 模型（不是自回归），
+    但 CacheMixin 仍然有用：
+    - 缓存不变的中间结果
+    - 支持未来可能的自回归视频生成扩展
+    
+    ═══════════════════════════════════════════════════════════════════════════
+    【Mixin 的继承顺序】
+    ═══════════════════════════════════════════════════════════════════════════
+    
+    class MyModel(ModelMixin, ConfigMixin, PeftAdapterMixin, CacheMixin):
+                    ↑           ↑            ↑              ↑
+                   第1个        第2个         第3个          第4个
+    
+    Python 的 MRO (Method Resolution Order) 决定方法查找顺序：
+    1. 先查找 MyModel 自己的方法
+    2. 然后按继承列表从左到右查找 Mixin
+    3. ModelMixin → ConfigMixin → PeftAdapterMixin → CacheMixin
+    
+    如果多个 Mixin 有同名方法，左边的优先。
+    
+    可以用 MyModel.__mro__ 查看完整的方法解析顺序。
     
     【完整前向传播流程】
     
@@ -960,6 +1208,103 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Cac
         # PyTorch: nn.ModuleList 自动注册子模块参数
         # Flax:    nnx.List 是 Flax NNX 的等价物
         #
+        # ══════════════════════════════════════════════════════════════════════
+        # 【Python 列表推导式语法详解】
+        # ══════════════════════════════════════════════════════════════════════
+        #
+        # 下面这段代码使用了 Python 的「列表推导式」(List Comprehension)：
+        #
+        #     [CogVideoXBlock(...) for _ in range(num_layers)]
+        #
+        # 这相当于以下普通循环的简洁写法：
+        #
+        #     blocks = []
+        #     for _ in range(num_layers):  # 循环 num_layers 次（如 30 或 42 次）
+        #         block = CogVideoXBlock(...)  # 每次创建一个新的块
+        #         blocks.append(block)         # 添加到列表中
+        #
+        # ──────────────────────────────────────────────────────────────────────
+        # 【`for _ in range(num_layers)` 各部分解释】
+        # ──────────────────────────────────────────────────────────────────────
+        #
+        # 1. `range(num_layers)`:
+        #    ─────────────────────
+        #    - range() 是 Python 内置函数，生成一个整数序列
+        #    - range(30) 生成: 0, 1, 2, 3, ..., 29 （共 30 个数）
+        #    - range(42) 生成: 0, 1, 2, 3, ..., 41 （共 42 个数）
+        #
+        #    相当于告诉 Python："我要循环 num_layers 次"
+        #
+        # 2. `_` (下划线变量):
+        #    ─────────────────────
+        #    - 这是一个约定俗成的「丢弃变量」命名
+        #    - 表示：我们不关心循环变量的值，只需要循环指定次数
+        #
+        #    对比两种写法：
+        #
+        #    【使用 _】（本代码的写法）
+        #    for _ in range(3):    # 循环 3 次，不关心当前是第几次
+        #        print("hello")    # 输出: hello hello hello
+        #
+        #    【使用普通变量 i】
+        #    for i in range(3):    # i 依次是 0, 1, 2
+        #        print(f"第 {i} 次")  # 输出: 第 0 次, 第 1 次, 第 2 次
+        #
+        #    在这里用 `_` 是因为每个 CogVideoXBlock 的初始化参数完全相同，
+        #    我们不需要知道当前是第几层。
+        #
+        # 3. `for _ in range(num_layers)`:
+        #    ─────────────────────
+        #    组合起来意思是：重复执行 num_layers 次
+        #
+        #    例如 num_layers=42（5B模型）:
+        #    - 创建第 0 个 CogVideoXBlock（_ = 0，但我们不使用这个值）
+        #    - 创建第 1 个 CogVideoXBlock（_ = 1，但我们不使用这个值）
+        #    - ...
+        #    - 创建第 41 个 CogVideoXBlock（_ = 41，但我们不使用这个值）
+        #    - 总共创建 42 个完全相同结构的块
+        #
+        # ──────────────────────────────────────────────────────────────────────
+        # 【为什么所有块的参数都一样？】
+        # ──────────────────────────────────────────────────────────────────────
+        #
+        # 虽然参数相同，但每个块有**独立的可学习权重**！
+        #
+        # 每次调用 CogVideoXBlock(...) 都会：
+        # - 创建新的 nn.Linear 层（随机初始化权重）
+        # - 创建新的 LayerNorm 层
+        # - 创建新的 Attention 层
+        #
+        # 所以 42 个块虽然结构相同，但权重是独立的，训练后会学到不同的值。
+        #
+        # 类比：
+        # - 结构相同 = 42 个相同户型的公寓
+        # - 权重独立 = 每个公寓的装修和家具都不同
+        #
+        # ──────────────────────────────────────────────────────────────────────
+        # 【等价的普通 for 循环写法】
+        # ──────────────────────────────────────────────────────────────────────
+        #
+        # 如果不用列表推导式，可以这样写（功能完全相同）：
+        #
+        #     transformer_blocks = []
+        #     for layer_idx in range(num_layers):
+        #         block = CogVideoXBlock(
+        #             dim=inner_dim,
+        #             num_attention_heads=num_attention_heads,
+        #             attention_head_dim=attention_head_dim,
+        #             time_embed_dim=time_embed_dim,
+        #             dropout=dropout,
+        #             activation_fn=activation_fn,
+        #             attention_bias=attention_bias,
+        #             norm_elementwise_affine=norm_elementwise_affine,
+        #             norm_eps=norm_eps,
+        #         )
+        #         transformer_blocks.append(block)
+        #     self.transformer_blocks = nn.ModuleList(transformer_blocks)
+        #
+        # 列表推导式更简洁，是 Python 的惯用写法。
+        #
         self.transformer_blocks = nn.ModuleList(
             [
                 CogVideoXBlock(
@@ -973,7 +1318,7 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Cac
                     norm_elementwise_affine=norm_elementwise_affine,
                     norm_eps=norm_eps,
                 )
-                for _ in range(num_layers)
+                for _ in range(num_layers)  # ← 创建 num_layers 个相同结构的块
             ]
         )
         

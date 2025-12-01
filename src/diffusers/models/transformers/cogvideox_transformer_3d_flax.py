@@ -305,6 +305,8 @@ class FlaxCogVideoXPatchEmbed(nnx.Module):
             elif not self.use_learned_positional_embeddings:
                 # Sinusoidal positional embeddings
                 pos_embed = self._get_sinusoidal_pos_embed(image_embeds.shape[1], self.embed_dim)
+                # Convert to same dtype as image_embeds to avoid type promotion (float32 + bfloat16 -> float32)
+                pos_embed = pos_embed.astype(image_embeds.dtype)
                 image_embeds = image_embeds + pos_embed[None, :, :]
         
         # Concatenate text and image embeddings
