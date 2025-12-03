@@ -1365,26 +1365,145 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Cac
         # 开启后可节省显存，但会增加计算时间
         self.gradient_checkpointing = False
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # Attention Processor 相关方法 - 注意力处理器的获取、设置与优化
+    # ══════════════════════════════════════════════════════════════════════════
+    #
+    # 【什么是 Attention Processor？】
+    #
+    # Attention Processor 是 diffusers 的一个核心设计模式，用于将注意力计算
+    # 的**具体实现**与注意力层的**结构定义**分离。
+    #
+    # ┌─────────────────────────────────────────────────────────────────────────────────┐
+    # │ 组件                    │ 职责                                                  │
+    # ├─────────────────────────────────────────────────────────────────────────────────┤
+    # │ Attention 类            │ 定义 Q/K/V 投影层、输出投影层的结构                    │
+    # │ AttentionProcessor 类   │ 定义如何计算 softmax(QK^T/√d)V                        │
+    # └─────────────────────────────────────────────────────────────────────────────────┘
+    #
+    # 这种分离带来的好处：
+    #
+    # 1. **灵活切换实现**: 同一个模型可以使用不同的注意力计算方式
+    #    - 标准实现: AttnProcessor (慢但兼容性好)
+    #    - PyTorch 2.0: AttnProcessor2_0 (使用 scaled_dot_product_attention)
+    #    - Flash Attention: FlashAttnProcessor (更快，更省显存)
+    #    - xFormers: XFormersAttnProcessor (高效的第三方实现)
+    #
+    # 2. **支持 LoRA 等适配器**: 可以用特殊的 Processor 注入 LoRA 权重
+    #    - LoRAAttnProcessor: 在注意力计算中添加 LoRA 矩阵
+    #
+    # 3. **自定义注意力行为**: 如 IP-Adapter、ControlNet 等需要修改注意力
+    #
+    # 【CogVideoX 使用的 Processor】
+    #
+    # - CogVideoXAttnProcessor2_0: 标准版本，使用 F.scaled_dot_product_attention
+    # - FusedCogVideoXAttnProcessor2_0: 融合版本，QKV 投影合并为单个矩阵
+    #
+    # ════════════════════════════════════════════════════════════════════════════════
+
     @property
     # Copied from diffusers.models.unets.unet_2d_condition.UNet2DConditionModel.attn_processors
     def attn_processors(self) -> Dict[str, AttentionProcessor]:
-        r"""
-        Returns:
-            `dict` of attention processors: A dictionary containing all attention processors used in the model with
-            indexed by its weight name.
         """
-        # set recursively
+        获取模型中所有注意力处理器的字典。
+        
+        ═══════════════════════════════════════════════════════════════════════════
+        【功能说明】
+        ═══════════════════════════════════════════════════════════════════════════
+        
+        递归遍历模型的所有子模块，收集每个 Attention 层的 processor。
+        
+        返回一个字典，格式如下:
+        
+            {
+                "transformer_blocks.0.attn1.processor": CogVideoXAttnProcessor2_0(),
+                "transformer_blocks.1.attn1.processor": CogVideoXAttnProcessor2_0(),
+                ...
+                "transformer_blocks.41.attn1.processor": CogVideoXAttnProcessor2_0(),
+            }
+        
+        对于 CogVideoX-5B，共有 42 个 Transformer 块，每块 1 个注意力层，
+        所以返回的字典有 42 个键值对。
+        
+        ═══════════════════════════════════════════════════════════════════════════
+        【@property 装饰器说明】
+        ═══════════════════════════════════════════════════════════════════════════
+        
+        @property 让方法可以像属性一样访问（不需要括号）:
+        
+            # 使用方式
+            processors = model.attn_processors  # 不需要 ()
+            
+            # 等价于（如果没有 @property）
+            processors = model.attn_processors()  # 需要 ()
+        
+        ═══════════════════════════════════════════════════════════════════════════
+        【使用场景】
+        ═══════════════════════════════════════════════════════════════════════════
+        
+        1. 检查当前使用的 Processor 类型:
+        
+            for name, processor in model.attn_processors.items():
+                print(f"{name}: {processor.__class__.__name__}")
+        
+        2. 在 set_attn_processor 之前获取原始 Processor（用于恢复）
+        
+        3. 调试和分析模型结构
+        
+        Returns:
+            Dict[str, AttentionProcessor]: 模块路径 → Processor 实例的映射
+        """
+        # 用于存储结果的字典
         processors = {}
 
         def fn_recursive_add_processors(name: str, module: torch.nn.Module, processors: Dict[str, AttentionProcessor]):
+            """
+            递归函数：遍历模块树，收集所有注意力处理器。
+            
+            【递归逻辑】
+            
+            对于模块树:
+            
+                model
+                ├── patch_embed (没有 processor)
+                ├── transformer_blocks
+                │   ├── 0
+                │   │   ├── attn1 (有 processor!)
+                │   │   ├── norm1
+                │   │   └── ff
+                │   └── 1
+                │       ├── attn1 (有 processor!)
+                │       └── ...
+                └── ...
+            
+            递归过程:
+            1. 检查当前模块是否有 get_processor 方法
+            2. 如果有，将其 processor 加入字典
+            3. 递归处理所有子模块
+            
+            【路径构建】
+            
+            name 参数累积构建完整路径:
+            - "transformer_blocks"
+            - "transformer_blocks.0"
+            - "transformer_blocks.0.attn1"
+            - "transformer_blocks.0.attn1.processor"
+            """
+            # 检查当前模块是否是 Attention 层（有 get_processor 方法）
             if hasattr(module, "get_processor"):
+                # 将 processor 添加到字典，键名格式: "xxx.yyy.processor"
                 processors[f"{name}.processor"] = module.get_processor()
 
+            # 递归处理所有子模块
+            # named_children() 返回 (子模块名, 子模块实例) 的迭代器
             for sub_name, child in module.named_children():
+                # 构建完整路径: "parent.child"
                 fn_recursive_add_processors(f"{name}.{sub_name}", child, processors)
 
             return processors
 
+        # 从顶层开始递归
+        # named_children() 只返回直接子模块（不递归）
         for name, module in self.named_children():
             fn_recursive_add_processors(name, module, processors)
 
@@ -1392,20 +1511,87 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Cac
 
     # Copied from diffusers.models.unets.unet_2d_condition.UNet2DConditionModel.set_attn_processor
     def set_attn_processor(self, processor: Union[AttentionProcessor, Dict[str, AttentionProcessor]]):
-        r"""
-        Sets the attention processor to use to compute attention.
-
-        Parameters:
-            processor (`dict` of `AttentionProcessor` or only `AttentionProcessor`):
-                The instantiated processor class or a dictionary of processor classes that will be set as the processor
-                for **all** `Attention` layers.
-
-                If `processor` is a dict, the key needs to define the path to the corresponding cross attention
-                processor. This is strongly recommended when setting trainable attention processors.
-
         """
+        设置模型中所有注意力层使用的处理器。
+        
+        ═══════════════════════════════════════════════════════════════════════════
+        【功能说明】
+        ═══════════════════════════════════════════════════════════════════════════
+        
+        将指定的 AttentionProcessor 应用到模型的所有（或指定的）注意力层。
+        
+        支持两种调用方式:
+        
+        ───────────────────────────────────────────────────────────────────────────
+        方式 1: 传入单个 Processor（应用到所有层）
+        ───────────────────────────────────────────────────────────────────────────
+        
+            # 将所有注意力层切换到融合版本
+            model.set_attn_processor(FusedCogVideoXAttnProcessor2_0())
+            
+            效果: 所有 42 个注意力层都使用同一类型的 Processor
+            （注意: 是同一个实例还是同一类型？这里是同一个实例）
+        
+        ───────────────────────────────────────────────────────────────────────────
+        方式 2: 传入字典（为每层单独指定）
+        ───────────────────────────────────────────────────────────────────────────
+        
+            processors = {
+                "transformer_blocks.0.attn1.processor": CustomProcessor1(),
+                "transformer_blocks.1.attn1.processor": CustomProcessor2(),
+                ...
+            }
+            model.set_attn_processor(processors)
+            
+            效果: 每层可以有不同的 Processor
+            用途: LoRA、IP-Adapter 等需要对不同层有不同行为
+        
+        ═══════════════════════════════════════════════════════════════════════════
+        【使用场景】
+        ═══════════════════════════════════════════════════════════════════════════
+        
+        1. **切换到更高效的实现**:
+        
+            # 使用 xFormers 加速
+            from diffusers.models.attention_processor import XFormersAttnProcessor
+            model.set_attn_processor(XFormersAttnProcessor())
+        
+        2. **启用 QKV 融合**:
+        
+            model.fuse_qkv_projections()  # 内部调用 set_attn_processor
+        
+        3. **加载 LoRA 权重后更新 Processor**:
+        
+            # LoRA 加载时会自动调用此方法设置 LoRAAttnProcessor
+        
+        4. **恢复原始 Processor**:
+        
+            # 保存原始 Processor
+            original = model.attn_processors
+            
+            # 切换到新 Processor
+            model.set_attn_processor(NewProcessor())
+            
+            # 恢复原始
+            model.set_attn_processor(original)
+        
+        ═══════════════════════════════════════════════════════════════════════════
+        【参数验证】
+        ═══════════════════════════════════════════════════════════════════════════
+        
+        如果传入字典，会验证字典的大小与注意力层数量是否匹配。
+        
+        例如 CogVideoX-5B 有 42 个注意力层:
+        - 如果字典只有 40 个键，会报错
+        - 如果字典有 44 个键，也会报错
+        
+        Parameters:
+            processor: 单个 Processor 实例 或 {路径: Processor} 字典
+        """
+        # 获取当前模型中注意力层的数量
         count = len(self.attn_processors.keys())
 
+        # 验证: 如果传入字典，其大小必须与注意力层数量一致
         if isinstance(processor, dict) and len(processor) != count:
             raise ValueError(
                 f"A dict of processors was passed, but the number of processors {len(processor)} does not match the"
@@ -1413,47 +1599,226 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Cac
             )
 
         def fn_recursive_attn_processor(name: str, module: torch.nn.Module, processor):
+            """
+            递归函数：遍历模块树，设置每个注意力层的 Processor。
+            
+            【两种模式的处理逻辑】
+            
+            模式 1 - 单个 Processor (processor 不是字典):
+                所有注意力层使用同一个 Processor 实例
+                
+            模式 2 - 字典 (processor 是字典):
+                从字典中 pop 出对应路径的 Processor
+                注意: 使用 pop 而不是 get，因为:
+                - pop 可以确保每个 Processor 只被使用一次
+                - 最后可以检查字典是否清空（没有多余的键）
+            """
+            # 检查当前模块是否是 Attention 层（有 set_processor 方法）
             if hasattr(module, "set_processor"):
                 if not isinstance(processor, dict):
+                    # 模式 1: 所有层使用同一个 Processor
                     module.set_processor(processor)
                 else:
+                    # 模式 2: 从字典中取出对应的 Processor
                     module.set_processor(processor.pop(f"{name}.processor"))
 
+            # 递归处理所有子模块
             for sub_name, child in module.named_children():
                 fn_recursive_attn_processor(f"{name}.{sub_name}", child, processor)
 
+        # 从顶层开始递归设置
         for name, module in self.named_children():
             fn_recursive_attn_processor(name, module, processor)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # QKV 投影融合 - 一种重要的性能优化技术
+    # ══════════════════════════════════════════════════════════════════════════
+    #
+    # 【什么是 QKV 投影融合？】
+    #
+    # 在标准 Transformer 注意力中，Q、K、V 是分别计算的:
+    #
+    #     Q = x @ W_q  # (B, L, D) @ (D, D) → (B, L, D)
+    #     K = x @ W_k  # (B, L, D) @ (D, D) → (B, L, D)
+    #     V = x @ W_v  # (B, L, D) @ (D, D) → (B, L, D)
+    #
+    # 这需要 3 次矩阵乘法，3 次内存读取权重矩阵。
+    #
+    # 【融合后的计算】
+    #
+    # 将 W_q, W_k, W_v 合并成一个大矩阵 W_qkv:
+    #
+    #     W_qkv = [W_q; W_k; W_v]  # (D, 3*D)
+    #
+    #     QKV = x @ W_qkv  # (B, L, D) @ (D, 3*D) → (B, L, 3*D)
+    #     Q, K, V = QKV.chunk(3, dim=-1)  # 拆分
+    #
+    # 只需 1 次矩阵乘法，1 次内存读取！
+    #
+    # 【性能提升原理】
+    #
+    # ┌─────────────────────────────────────────────────────────────────────────────────┐
+    # │ 方面              │ 融合前                    │ 融合后                          │
+    # ├─────────────────────────────────────────────────────────────────────────────────┤
+    # │ 矩阵乘法次数       │ 3 次                      │ 1 次                            │
+    # │ 内存读取次数       │ 3 次 (W_q, W_k, W_v)      │ 1 次 (W_qkv)                    │
+    # │ Kernel 启动次数   │ 3 次                      │ 1 次                            │
+    # │ 参数量            │ 相同                      │ 相同                            │
+    # │ 计算量            │ 相同                      │ 相同                            │
+    # └─────────────────────────────────────────────────────────────────────────────────┘
+    #
+    # 主要收益来自:
+    # 1. 减少 GPU Kernel 启动开销
+    # 2. 减少内存访问次数（权重从显存读取是瓶颈）
+    # 3. 更好的矩阵乘法效率（大矩阵乘法比多个小矩阵更高效）
+    #
+    # 【实测加速效果】
+    #
+    # 典型场景下可以获得 10-20% 的推理速度提升。
+    #
+    # 【为什么不默认开启？】
+    #
+    # 1. 改变了权重的存储格式，与预训练权重不直接兼容
+    # 2. LoRA 等技术需要单独的 Q/K/V 矩阵
+    # 3. 某些自定义注意力实现不支持融合格式
+    #
+    # ════════════════════════════════════════════════════════════════════════════════
 
     # Copied from diffusers.models.unets.unet_2d_condition.UNet2DConditionModel.fuse_qkv_projections with FusedAttnProcessor2_0->FusedCogVideoXAttnProcessor2_0
     def fuse_qkv_projections(self):
         """
-        Enables fused QKV projections. For self-attention modules, all projection matrices (i.e., query, key, value)
-        are fused. For cross-attention modules, key and value projection matrices are fused.
-
-        > [!WARNING] > This API is 🧪 experimental.
+        启用 QKV 投影融合，提升推理性能。
+        
+        ═══════════════════════════════════════════════════════════════════════════
+        【功能说明】
+        ═══════════════════════════════════════════════════════════════════════════
+        
+        将每个 Attention 层中分离的 W_q, W_k, W_v 矩阵合并成一个 W_qkv 矩阵，
+        并切换到使用 FusedCogVideoXAttnProcessor2_0 处理器。
+        
+        调用步骤:
+        1. 保存当前的 attn_processors（用于之后恢复）
+        2. 检查是否有不兼容的 Processor（如 Added KV Projections）
+        3. 对每个 Attention 层调用 fuse_projections(fuse=True)
+        4. 设置 FusedCogVideoXAttnProcessor2_0 作为新的 Processor
+        
+        ═══════════════════════════════════════════════════════════════════════════
+        【使用方法】
+        ═══════════════════════════════════════════════════════════════════════════
+        
+            # 加载模型
+            transformer = CogVideoXTransformer3DModel.from_pretrained(...)
+            
+            # 启用 QKV 融合
+            transformer.fuse_qkv_projections()
+            
+            # 现在推理会更快
+            output = transformer(hidden_states, encoder_hidden_states, timestep)
+            
+            # 如果需要，可以恢复原状
+            transformer.unfuse_qkv_projections()
+        
+        ═══════════════════════════════════════════════════════════════════════════
+        【内部实现细节】
+        ═══════════════════════════════════════════════════════════════════════════
+        
+        fuse_projections(fuse=True) 内部做了什么:
+        
+        1. 创建融合权重矩阵:
+           
+           W_qkv = torch.cat([W_q, W_k, W_v], dim=0)  # 沿输出维度拼接
+           
+        2. 创建融合偏置（如果有）:
+           
+           b_qkv = torch.cat([b_q, b_k, b_v], dim=0)
+           
+        3. 创建新的 nn.Linear 层存储融合后的权重
+        
+        4. 删除原来的 q_proj, k_proj, v_proj 以节省显存
+        
+        ═══════════════════════════════════════════════════════════════════════════
+        【注意事项】
+        ═══════════════════════════════════════════════════════════════════════════
+        
+        ⚠️ 这是实验性 API，可能在未来版本中更改
+        
+        ⚠️ 不兼容的情况:
+        - 带有 "Added" KV Projections 的模型（用于 IP-Adapter 等）
+        - 已经加载 LoRA 的模型
+        
+        ⚠️ 融合后:
+        - 无法单独访问 W_q, W_k, W_v
+        - 保存模型时权重格式会改变
         """
+        # 初始化原始处理器存储（用于 unfuse 时恢复）
         self.original_attn_processors = None
 
+        # 检查是否有不兼容的 Processor
+        # "Added" 表示有额外的 KV Projections（如 IP-Adapter 注入的）
         for _, attn_processor in self.attn_processors.items():
             if "Added" in str(attn_processor.__class__.__name__):
                 raise ValueError("`fuse_qkv_projections()` is not supported for models having added KV projections.")
 
+        # 保存当前的 Processor，以便之后可以恢复
         self.original_attn_processors = self.attn_processors
 
+        # 遍历所有模块，对 Attention 层执行融合
         for module in self.modules():
             if isinstance(module, Attention):
+                # fuse_projections(fuse=True) 执行实际的权重融合
                 module.fuse_projections(fuse=True)
 
+        # 设置融合版本的 Processor
+        # FusedCogVideoXAttnProcessor2_0 知道如何处理融合后的 QKV 矩阵
         self.set_attn_processor(FusedCogVideoXAttnProcessor2_0())
 
     # Copied from diffusers.models.unets.unet_2d_condition.UNet2DConditionModel.unfuse_qkv_projections
     def unfuse_qkv_projections(self):
-        """Disables the fused QKV projection if enabled.
-
-        > [!WARNING] > This API is 🧪 experimental.
-
         """
+        禁用 QKV 投影融合，恢复到原始状态。
+        
+        ═══════════════════════════════════════════════════════════════════════════
+        【功能说明】
+        ═══════════════════════════════════════════════════════════════════════════
+        
+        将之前融合的 QKV 投影恢复为分离的 Q、K、V 投影。
+        
+        注意: 这个方法只恢复 Processor，不恢复权重矩阵的分离状态。
+        如果需要完全恢复，可能需要重新加载模型。
+        
+        ═══════════════════════════════════════════════════════════════════════════
+        【使用场景】
+        ═══════════════════════════════════════════════════════════════════════════
+        
+        1. **需要加载 LoRA**:
+        
+            transformer.fuse_qkv_projections()  # 融合以加速
+            # ... 推理 ...
+            
+            transformer.unfuse_qkv_projections()  # 取消融合
+            transformer.load_lora_weights(...)     # 现在可以加载 LoRA
+        
+        2. **保存标准格式权重**:
+        
+            # 融合状态下保存的权重格式不同
+            transformer.unfuse_qkv_projections()
+            transformer.save_pretrained("./model")
+        
+        3. **切换到自定义 Processor**:
+        
+            transformer.unfuse_qkv_projections()
+            transformer.set_attn_processor(MyCustomProcessor())
+        
+        ═══════════════════════════════════════════════════════════════════════════
+        【注意事项】
+        ═══════════════════════════════════════════════════════════════════════════
+        
+        ⚠️ 这是实验性 API
+        
+        ⚠️ 只有在之前调用过 fuse_qkv_projections() 才有效
+           否则 original_attn_processors 为 None，不会执行任何操作
+        """
+        # 只有当存储了原始 Processor 时才恢复
         if self.original_attn_processors is not None:
             self.set_attn_processor(self.original_attn_processors)
 
