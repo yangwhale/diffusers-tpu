@@ -24,7 +24,7 @@ from ...configuration_utils import ConfigMixin, register_to_config
 from ...loaders import PeftAdapterMixin
 from ...utils import USE_PEFT_BACKEND, logging, scale_lora_layers, unscale_lora_layers
 from ..attention import AttentionMixin, FeedForward
-from ..attention_dispatch import dispatch_attention_fn
+from ..attention_dispatch import AttentionBackendName, dispatch_attention_fn
 from ..attention_processor import Attention
 from ..cache_utils import CacheMixin
 from ..embeddings import (
@@ -42,7 +42,7 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
 class HunyuanVideo15AttnProcessor2_0:
-    _attention_backend = None
+    _attention_backend = AttentionBackendName.FLASH  # Use Flash Attention to avoid OOM
     _parallel_config = None
 
     def __init__(self):
