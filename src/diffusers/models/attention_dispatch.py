@@ -69,11 +69,20 @@ _CAN_USE_XFORMERS_ATTN = is_xformers_available() and is_xformers_version(">=", _
 if _CAN_USE_FLASH_ATTN:
     from flash_attn import flash_attn_func, flash_attn_varlen_func
     from flash_attn.flash_attn_interface import _wrapped_flash_attn_backward, _wrapped_flash_attn_forward
+    # Import optimized no-pad version from HunyuanVideo
+    try:
+        from .flash_attn_no_pad import flash_attn_no_pad
+        _HAS_FLASH_ATTN_NO_PAD = True
+    except ImportError:
+        flash_attn_no_pad = None
+        _HAS_FLASH_ATTN_NO_PAD = False
 else:
     flash_attn_func = None
     flash_attn_varlen_func = None
     _wrapped_flash_attn_backward = None
     _wrapped_flash_attn_forward = None
+    flash_attn_no_pad = None
+    _HAS_FLASH_ATTN_NO_PAD = False
 
 
 if _CAN_USE_FLASH_ATTN_3:
@@ -1329,6 +1338,7 @@ def _flash_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
+    attn_mask: Optional[torch.Tensor] = None,
     dropout_p: float = 0.0,
     is_causal: bool = False,
     scale: Optional[float] = None,
@@ -1337,17 +1347,31 @@ def _flash_attention(
 ) -> torch.Tensor:
     lse = None
     if _parallel_config is None:
-        out = flash_attn_func(
-            q=query,
-            k=key,
-            v=value,
-            dropout_p=dropout_p,
-            softmax_scale=scale,
-            causal=is_causal,
-            return_attn_probs=return_lse,
-        )
-        if return_lse:
-            out, lse, *_ = out
+        # Use optimized no-pad version if available and mask is provided
+        if _HAS_FLASH_ATTN_NO_PAD and attn_mask is not None:
+            # Stack q, k, v into qkv format: [B, S, 3, H, D]
+            qkv = torch.stack([query, key, value], dim=2)
+            out = flash_attn_no_pad(
+                qkv=qkv,
+                key_padding_mask=attn_mask,
+                causal=is_causal,
+                dropout_p=dropout_p,
+                softmax_scale=scale,
+            )
+            # Note: flash_attn_no_pad doesn't return lse
+        else:
+            # Fall back to standard flash_attn_func
+            out = flash_attn_func(
+                q=query,
+                k=key,
+                v=value,
+                dropout_p=dropout_p,
+                softmax_scale=scale,
+                causal=is_causal,
+                return_attn_probs=return_lse,
+            )
+            if return_lse:
+                out, lse, *_ = out
     else:
         out = _templated_context_parallel_attention(
             query,
