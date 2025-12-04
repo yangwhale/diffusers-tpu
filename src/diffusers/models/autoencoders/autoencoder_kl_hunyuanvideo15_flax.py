@@ -1200,6 +1200,32 @@ class FlaxAutoencoderKLHunyuanVideo15(nnx.Module):
         
         overlap_height = int(self.tile_latent_min_height * (1 - self.tile_overlap_factor))
         overlap_width = int(self.tile_latent_min_width * (1 - self.tile_overlap_factor))
+        
+        # 安全检查：确保 overlap 至少为 1，避免 range() 步长为 0
+        # 如果 tile 设置有问题，回退到不使用 tiling
+        if overlap_height <= 0 or overlap_width <= 0:
+            print(f"Warning: Invalid tiling parameters (overlap_h={overlap_height}, overlap_w={overlap_width}). "
+                  f"Falling back to non-tiled decode.")
+            # 使用逐帧解码，绕过 tiling
+            feat_cache_manager = FlaxHunyuanVideo15Cache(self.decoder)
+            decoded_frames_list = []
+            num_frames = z.shape[1]
+            
+            for i in range(num_frames):
+                feat_cache_manager._conv_idx = [0]
+                z_frame = z[:, i:i+1, :, :, :]
+                is_first_frame = (i == 0)
+                decoded_frame = self.decoder(
+                    z_frame,
+                    feat_cache=feat_cache_manager._feat_map,
+                    feat_idx=feat_cache_manager._conv_idx,
+                    is_first_frame=is_first_frame,
+                )
+                decoded_frames_list.append(decoded_frame)
+            
+            decoded = jnp.concatenate(decoded_frames_list, axis=1)
+            return jnp.clip(decoded, -1.0, 1.0)
+        
         blend_height = int(self.tile_sample_min_height * self.tile_overlap_factor)
         blend_width = int(self.tile_sample_min_width * self.tile_overlap_factor)
         row_limit_height = self.tile_sample_min_height - blend_height
@@ -1285,18 +1311,50 @@ class FlaxAutoencoderKLHunyuanVideo15(nnx.Module):
         
         print(f"[2/4] Downloading PyTorch weights...")
         
-        ckpt_path = hf_hub_download(
-            pretrained_model_name_or_path,
-            subfolder=subfolder,
-            filename="diffusion_pytorch_model.safetensors"
-        )
+        # 检查是否是分片权重
+        try:
+            index_path = hf_hub_download(
+                pretrained_model_name_or_path,
+                subfolder=subfolder,
+                filename="diffusion_pytorch_model.safetensors.index.json"
+            )
+            
+            # 分片权重
+            with open(index_path, 'r') as f:
+                index_data = json.load(f)
+            
+            # 获取所有分片文件名
+            weight_map = index_data.get("weight_map", {})
+            shard_files = set(weight_map.values())
+            print(f"  Found {len(shard_files)} sharded weight files")
+            
+            # 下载所有分片
+            pytorch_weights = {}
+            for shard_file in sorted(shard_files):
+                shard_path = hf_hub_download(
+                    pretrained_model_name_or_path,
+                    subfolder=subfolder,
+                    filename=shard_file
+                )
+                print(f"    Loading {shard_file}...")
+                with safe_open(shard_path, framework="np") as f:
+                    for key in f.keys():
+                        pytorch_weights[key] = f.get_tensor(key)
+        except Exception as e:
+            # 单文件权重
+            print(f"  No sharded weights found, trying single file...")
+            ckpt_path = hf_hub_download(
+                pretrained_model_name_or_path,
+                subfolder=subfolder,
+                filename="diffusion_pytorch_model.safetensors"
+            )
+            
+            pytorch_weights = {}
+            with safe_open(ckpt_path, framework="np") as f:
+                for key in f.keys():
+                    pytorch_weights[key] = f.get_tensor(key)
         
         print(f"[3/4] Converting weights to JAX format...")
-        
-        pytorch_weights = {}
-        with safe_open(ckpt_path, framework="np") as f:
-            for key in f.keys():
-                pytorch_weights[key] = f.get_tensor(key)
         
         print(f"  Loaded {len(pytorch_weights)} PyTorch weight tensors")
         
@@ -1331,8 +1389,20 @@ class FlaxAutoencoderKLHunyuanVideo15(nnx.Module):
                 elif len(jax_tensor.shape) == 4:
                     jax_tensor = jax_tensor.transpose(2, 3, 1, 0)
             
-            if ".weight" in jax_key and ("norm" in jax_key or "gamma" in jax_key):
+            # 处理 RMSNorm 的 gamma/weight（需要 flatten）
+            if ".weight" in jax_key and "norm" in jax_key:
                 jax_key = jax_key.replace(".weight", ".gamma")
+                # PyTorch RMSNorm weight 可能是 (C, 1, 1, 1) 或 (C,)，需要 flatten 为 (C,)
+                if len(jax_tensor.shape) > 1:
+                    jax_tensor = jax_tensor.squeeze()
+            
+            # 处理 gamma 参数
+            if ".gamma" in jax_key and len(jax_tensor.shape) > 1:
+                jax_tensor = jax_tensor.squeeze()
+            
+            # 处理 bias 参数
+            if ".bias" in jax_key and len(jax_tensor.shape) > 1:
+                jax_tensor = jax_tensor.squeeze()
             
             jax_weights[jax_key] = jnp.array(jax_tensor, dtype=dtype)
         
