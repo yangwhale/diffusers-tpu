@@ -42,7 +42,10 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
 class HunyuanVideo15AttnProcessor2_0:
-    _attention_backend = AttentionBackendName.FLASH  # Use Flash Attention to avoid OOM
+    # TPU MOD: Use NATIVE backend so it calls torch.nn.functional.scaled_dot_product_attention
+    # which we have monkeypatched to use Splash Attention.
+    # Original was AttentionBackendName.FLASH which tries to import flash_attn lib (unavailable on TPU).
+    _attention_backend = AttentionBackendName.NATIVE
     _parallel_config = None
 
     def __init__(self):
@@ -617,6 +620,7 @@ class HunyuanVideo15Transformer3DModel(
         image_embeds: Optional[torch.Tensor] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
+        is_t2v: bool = True,  # TPU-compatible: static parameter for text-to-video mode
     ) -> Union[Tuple[torch.Tensor], Transformer2DModelOutput]:
         if attention_kwargs is not None:
             attention_kwargs = attention_kwargs.copy()
@@ -665,7 +669,9 @@ class HunyuanVideo15Transformer3DModel(
 
         # image embed
         encoder_hidden_states_3 = self.image_embedder(image_embeds)
-        is_t2v = torch.all(image_embeds == 0)
+        # Note: is_t2v is now a static parameter (passed from caller) for TPU/JAX JIT compatibility.
+        # Previously it was computed dynamically: is_t2v = torch.all(image_embeds == 0)
+        # For text-to-video, caller should pass is_t2v=True. For image-to-video, pass is_t2v=False.
         if is_t2v:
             encoder_hidden_states_3 = encoder_hidden_states_3 * 0.0
             encoder_attention_mask_3 = torch.zeros(
@@ -688,53 +694,18 @@ class HunyuanVideo15Transformer3DModel(
         )
         encoder_hidden_states_3 = encoder_hidden_states_3 + encoder_hidden_states_3_cond_emb
 
-        # reorder and combine text tokens: combine valid tokens first, then padding
-        encoder_attention_mask = encoder_attention_mask.bool()
-        encoder_attention_mask_2 = encoder_attention_mask_2.bool()
-        encoder_attention_mask_3 = encoder_attention_mask_3.bool()
-        new_encoder_hidden_states = []
-        new_encoder_attention_mask = []
-
-        for text, text_mask, text_2, text_mask_2, image, image_mask in zip(
-            encoder_hidden_states,
-            encoder_attention_mask,
-            encoder_hidden_states_2,
-            encoder_attention_mask_2,
-            encoder_hidden_states_3,
-            encoder_attention_mask_3,
-        ):
-            # Concatenate: [valid_image, valid_byt5, valid_mllm, invalid_image, invalid_byt5, invalid_mllm]
-            new_encoder_hidden_states.append(
-                torch.cat(
-                    [
-                        image[image_mask],  # valid image
-                        text_2[text_mask_2],  # valid byt5
-                        text[text_mask],  # valid mllm
-                        image[~image_mask],  # invalid image
-                        torch.zeros_like(text_2[~text_mask_2]),  # invalid byt5 (zeroed)
-                        torch.zeros_like(text[~text_mask]),  # invalid mllm (zeroed)
-                    ],
-                    dim=0,
-                )
-            )
-
-            # Apply same reordering to attention masks
-            new_encoder_attention_mask.append(
-                torch.cat(
-                    [
-                        image_mask[image_mask],
-                        text_mask_2[text_mask_2],
-                        text_mask[text_mask],
-                        image_mask[~image_mask],
-                        text_mask_2[~text_mask_2],
-                        text_mask[~text_mask],
-                    ],
-                    dim=0,
-                )
-            )
-
-        encoder_hidden_states = torch.stack(new_encoder_hidden_states)
-        encoder_attention_mask = torch.stack(new_encoder_attention_mask)
+        # SIMPLIFIED: Directly concatenate hidden states and masks.
+        # This avoids dynamic boolean indexing which is incompatible with JAX JIT/TPU.
+        # The attention mechanism works correctly regardless of token order, as long as the mask is correct.
+        encoder_hidden_states = torch.cat(
+            [encoder_hidden_states_3, encoder_hidden_states_2, encoder_hidden_states],
+            dim=1,
+        )
+        
+        encoder_attention_mask = torch.cat(
+            [encoder_attention_mask_3, encoder_attention_mask_2, encoder_attention_mask],
+            dim=1,
+        )
 
         # 4. Transformer blocks
         if torch.is_grad_enabled() and self.gradient_checkpointing:
