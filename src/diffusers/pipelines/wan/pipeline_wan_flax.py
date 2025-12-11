@@ -627,8 +627,12 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                         timestep = t.expand(latents.shape[0] * 2)
                     encoder_hidden_state = torch.cat([prompt_embeds, negative_prompt_embeds])
 
-                    # Convert to JAX if text_encoder is on CPU
-                    if str(self.text_encoder.device) == 'cpu':
+                    # Convert to JAX if text_encoder is on CPU or None (pre-computed embeddings)
+                    text_encoder_on_cpu = (
+                        self.text_encoder is None or
+                        str(getattr(self.text_encoder, 'device', 'cpu')) == 'cpu'
+                    )
+                    if text_encoder_on_cpu:
                         latent_model_input = safe_torch_to_jax(latent_model_input, env)
                         if isinstance(latent_model_input, jnp.ndarray) or 'ArrayImpl' in str(type(latent_model_input)):
                             latent_model_input = latent_model_input.astype(jnp.bfloat16)
