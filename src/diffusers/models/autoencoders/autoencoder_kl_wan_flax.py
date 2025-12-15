@@ -184,21 +184,18 @@ class WanCausalConv3d(nn.Conv3d):
         try:
             x = mark_sharding(x, P(None, None, None, None, ("dp", "tp")))
             success = True
-            print("[DEBUG] Shard conv height along ('dp', 'tp')")
         except ValueError:
             pass
         if not success:
             try:
                 x = mark_sharding(x, P(None, None, None, None, ("tp")))
                 success = True
-                print("[DEBUG] Shard conv height along ('tp')")
             except ValueError:
                 pass
         if not success:
             try:
                 x = mark_sharding(x, P(None, None, None, None, ("dp")))
                 success = True
-                print("[DEBUG] Shard conv height along ('dp')")
             except ValueError:
                 pass
         return super().forward(x)
@@ -1226,7 +1223,6 @@ class AutoencoderKLWan(ModelMixin, AutoencoderMixin, ConfigMixin, FromOriginalMo
                 The latent representations of the encoded videos. If `return_dict` is True, a
                 [`~models.autoencoder_kl.AutoencoderKLOutput`] is returned, otherwise a plain `tuple` is returned.
         """
-        print(f"[DEBUG] {x.shape=}, {x.dtype=}")
         if self.use_slicing and x.shape[0] > 1:
             encoded_slices = [self._encode(x_slice) for x_slice in x.split(1)]
             h = torch.cat(encoded_slices)
@@ -1289,7 +1285,6 @@ class AutoencoderKLWan(ModelMixin, AutoencoderMixin, ConfigMixin, FromOriginalMo
                 If return_dict is True, a [`~models.vae.DecoderOutput`] is returned, otherwise a plain `tuple` is
                 returned.
         """
-        print(f"[DEBUG] {z.shape=}, {z.dtype=}")
         if self.use_slicing and z.shape[0] > 1:
             decoded_slices = [self._decode(z_slice).sample for z_slice in z.split(1)]
             decoded = torch.cat(decoded_slices)
