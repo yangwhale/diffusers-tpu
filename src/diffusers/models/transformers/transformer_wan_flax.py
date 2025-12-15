@@ -35,13 +35,6 @@ from ..normalization import FP32LayerNorm
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
-# ===================== TPU/JAX specific imports =====================
-import jax
-from torchax import interop
-from jax.sharding import PartitionSpec as P
-mark_sharding = interop.torch_view(jax.lax.with_sharding_constraint)
-# ====================================================================
-
 
 def _get_qkv_projections(attn: "WanAttention", hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor):
     # encoder_hidden_states is only passed for cross-attention
@@ -101,12 +94,6 @@ class WanAttnProcessor:
 
         query = attn.norm_q(query)
         key = attn.norm_k(key)
-
-        # ===================== TPU/JAX specific: add sharding constraints =====================
-        query = mark_sharding(query, P("dp", ("axis", "sp"), None))
-        key = mark_sharding(key, P("dp", ("axis", "sp"), None))
-        value = mark_sharding(value, P("dp", ("axis", "sp"), None))
-        # ======================================================================================
 
         query = query.unflatten(2, (attn.heads, -1))
         key = key.unflatten(2, (attn.heads, -1))
@@ -640,10 +627,6 @@ class WanTransformer3DModel(
         return_dict: bool = True,
         attention_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
-        # ===================== TPU/JAX specific: add sharding constraint =====================
-        encoder_hidden_states = mark_sharding(encoder_hidden_states, P("dp"))
-        # =====================================================================================
-
         if attention_kwargs is not None:
             attention_kwargs = attention_kwargs.copy()
             lora_scale = attention_kwargs.pop("scale", 1.0)
@@ -669,10 +652,6 @@ class WanTransformer3DModel(
 
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
-
-        # ===================== TPU/JAX specific: add sharding constraint =====================
-        hidden_states = mark_sharding(hidden_states, P("dp", ('axis','sp',), None))
-        # =====================================================================================
 
         # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
         if timestep.ndim == 2:
