@@ -1,4 +1,3 @@
-
 # Copyright 2025 The CogVideoX team, Tsinghua University & ZhipuAI and The HuggingFace Team.
 # All rights reserved.
 #
@@ -14,7 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, Optional, Tuple, Union
+"""
+CogVideoX VAE with Wan-style feat_cache for TPU compatibility.
+This version uses list-based feat_cache instead of dict-based conv_cache
+to be more TPU-friendly and avoid OOM during compilation.
+"""
+
+from typing import Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -40,6 +45,8 @@ mark_sharding = interop.torch_view(jax.lax.with_sharding_constraint)
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+CACHE_T = 2
 
 
 class CogVideoXSafeConv3d(nn.Conv3d):
@@ -75,6 +82,8 @@ class CogVideoXSafeConv3d(nn.Conv3d):
 
 class CogVideoXCausalConv3d(nn.Module):
     r"""A 3D causal convolution layer that pads the input tensor to ensure causality in CogVideoX Model.
+    
+    This version uses Wan-style feat_cache for TPU compatibility.
 
     Args:
         in_channels (`int`): Number of channels in the input tensor.
@@ -101,8 +110,6 @@ class CogVideoXCausalConv3d(nn.Module):
 
         time_kernel_size, height_kernel_size, width_kernel_size = kernel_size
 
-        # TODO(aryan): configure calculation based on stride and dilation in the future.
-        # Since CogVideoX does not use it, it is currently tailored to "just work" with Mochi
         time_pad = time_kernel_size - 1
         height_pad = (height_kernel_size - 1) // 2
         width_pad = (width_kernel_size - 1) // 2
@@ -129,64 +136,83 @@ class CogVideoXCausalConv3d(nn.Module):
             padding_mode="zeros",
         )
 
-    def fake_context_parallel_forward(
-        self, inputs: torch.Tensor, conv_cache: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+    def forward(self, inputs: torch.Tensor, feat_cache=None, feat_idx=0):
         if self.pad_mode == "replicate":
             inputs = F.pad(inputs, self.time_causal_padding, mode="replicate")
+            # Add sharding constraint for TPU
+            success = False
+            try:
+                inputs = mark_sharding(inputs, P(None, None, None, None, ("dp", "tp")))
+                success = True
+            except ValueError:
+                pass
+            if not success:
+                try:
+                    inputs = mark_sharding(inputs, P(None, None, None, None, ("tp")))
+                    success = True
+                except ValueError:
+                    pass
+            if not success:
+                try:
+                    inputs = mark_sharding(inputs, P(None, None, None, None, ("dp")))
+                    success = True
+                except ValueError:
+                    pass
+            output = self.conv(inputs)
+            return output, feat_idx, feat_cache
         else:
+            # Wan-style caching
             kernel_size = self.time_kernel_size
-            if kernel_size > 1:
-                cached_inputs = [conv_cache] if conv_cache is not None else [inputs[:, :, :1]] * (kernel_size - 1)
-                inputs = torch.cat(cached_inputs + [inputs], dim=2)
-        return inputs
-
-    def forward(self, inputs: torch.Tensor, conv_cache: Optional[torch.Tensor] = None) -> torch.Tensor:
-        inputs = self.fake_context_parallel_forward(inputs, conv_cache)
-
-        if self.pad_mode == "replicate":
-            conv_cache = None
-        else:
-            conv_cache = inputs[:, :, -self.time_kernel_size + 1 :].clone()
-
-        # Add sharding constraint for TPU
-        success = False
-        try:
-            inputs = mark_sharding(inputs, P(None, None, None, None, ("dp", "tp")))
-            success = True
-        except ValueError:
-            pass
-        if not success:
+            if feat_cache is not None and kernel_size > 1:
+                idx = feat_idx
+                cache_x = inputs[:, :, -CACHE_T:, :, :].clone()
+                if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
+                    cache_x = torch.cat([feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device), cache_x], dim=2)
+                
+                if feat_cache[idx] is not None:
+                    cached_inputs = feat_cache[idx]
+                    inputs = torch.cat([cached_inputs, inputs], dim=2)
+                else:
+                    # First time: replicate first frame
+                    cached_inputs = inputs[:, :, :1].repeat(1, 1, kernel_size - 1, 1, 1)
+                    inputs = torch.cat([cached_inputs, inputs], dim=2)
+                
+                feat_cache[idx] = cache_x
+                feat_idx += 1
+            elif kernel_size > 1:
+                # No cache, replicate first frame
+                cached_inputs = inputs[:, :, :1].repeat(1, 1, kernel_size - 1, 1, 1)
+                inputs = torch.cat([cached_inputs, inputs], dim=2)
+            
+            # Add sharding constraint for TPU
+            success = False
             try:
-                inputs = mark_sharding(inputs, P(None, None, None, None, ("tp")))
+                inputs = mark_sharding(inputs, P(None, None, None, None, ("dp", "tp")))
                 success = True
             except ValueError:
                 pass
-        if not success:
-            try:
-                inputs = mark_sharding(inputs, P(None, None, None, None, ("dp")))
-                success = True
-            except ValueError:
-                pass
-
-        output = self.conv(inputs)
-        return output, conv_cache
+            if not success:
+                try:
+                    inputs = mark_sharding(inputs, P(None, None, None, None, ("tp")))
+                    success = True
+                except ValueError:
+                    pass
+            if not success:
+                try:
+                    inputs = mark_sharding(inputs, P(None, None, None, None, ("dp")))
+                    success = True
+                except ValueError:
+                    pass
+            
+            output = self.conv(inputs)
+            return output, feat_idx, feat_cache
 
 
 class CogVideoXSpatialNorm3D(nn.Module):
     r"""
-    Spatially conditioned normalization as defined in https://huggingface.co/papers/2209.09002. This implementation is
-    specific to 3D-video like data.
-
-    CogVideoXSafeConv3d is used instead of nn.Conv3d to avoid OOM in CogVideoX Model.
-
-    Args:
-        f_channels (`int`):
-            The number of channels for input to group normalization layer, and output of the spatial norm layer.
-        zq_channels (`int`):
-            The number of channels for the quantized vector as described in the paper.
-        groups (`int`):
-            Number of groups to separate the channels into for group normalization.
+    Spatially conditioned normalization as defined in https://huggingface.co/papers/2209.09002.
+    
+    This version uses Wan-style feat_cache for TPU compatibility.
     """
 
     def __init__(
@@ -200,12 +226,7 @@ class CogVideoXSpatialNorm3D(nn.Module):
         self.conv_y = CogVideoXCausalConv3d(zq_channels, f_channels, kernel_size=1, stride=1)
         self.conv_b = CogVideoXCausalConv3d(zq_channels, f_channels, kernel_size=1, stride=1)
 
-    def forward(
-        self, f: torch.Tensor, zq: torch.Tensor, conv_cache: Optional[Dict[str, torch.Tensor]] = None
-    ) -> torch.Tensor:
-        new_conv_cache = {}
-        conv_cache = conv_cache or {}
-
+    def forward(self, f: torch.Tensor, zq: torch.Tensor, feat_cache=None, feat_idx=0):
         if f.shape[2] > 1 and f.shape[2] % 2 == 1:
             f_first, f_rest = f[:, :, :1], f[:, :, 1:]
             f_first_size, f_rest_size = f_first.shape[-3:], f_rest.shape[-3:]
@@ -216,39 +237,19 @@ class CogVideoXSpatialNorm3D(nn.Module):
         else:
             zq = F.interpolate(zq, size=f.shape[-3:])
 
-        conv_y, new_conv_cache["conv_y"] = self.conv_y(zq, conv_cache=conv_cache.get("conv_y"))
-        conv_b, new_conv_cache["conv_b"] = self.conv_b(zq, conv_cache=conv_cache.get("conv_b"))
+        conv_y, feat_idx, feat_cache = self.conv_y(zq, feat_cache=feat_cache, feat_idx=feat_idx)
+        conv_b, feat_idx, feat_cache = self.conv_b(zq, feat_cache=feat_cache, feat_idx=feat_idx)
 
         norm_f = self.norm_layer(f)
         new_f = norm_f * conv_y + conv_b
-        return new_f, new_conv_cache
+        return new_f, feat_idx, feat_cache
 
 
 class CogVideoXResnetBlock3D(nn.Module):
     r"""
     A 3D ResNet block used in the CogVideoX model.
-
-    Args:
-        in_channels (`int`):
-            Number of input channels.
-        out_channels (`int`, *optional*):
-            Number of output channels. If None, defaults to `in_channels`.
-        dropout (`float`, defaults to `0.0`):
-            Dropout rate.
-        temb_channels (`int`, defaults to `512`):
-            Number of time embedding channels.
-        groups (`int`, defaults to `32`):
-            Number of groups to separate the channels into for group normalization.
-        eps (`float`, defaults to `1e-6`):
-            Epsilon value for normalization layers.
-        non_linearity (`str`, defaults to `"swish"`):
-            Activation function to use.
-        conv_shortcut (bool, defaults to `False`):
-            Whether or not to use a convolution shortcut.
-        spatial_norm_dim (`int`, *optional*):
-            The dimension to use for spatial norm if it is to be used instead of group norm.
-        pad_mode (str, defaults to `"first"`):
-            Padding mode.
+    
+    This version uses Wan-style feat_cache for TPU compatibility.
     """
 
     def __init__(
@@ -316,72 +317,46 @@ class CogVideoXResnetBlock3D(nn.Module):
         inputs: torch.Tensor,
         temb: Optional[torch.Tensor] = None,
         zq: Optional[torch.Tensor] = None,
-        conv_cache: Optional[Dict[str, torch.Tensor]] = None,
-    ) -> torch.Tensor:
-        new_conv_cache = {}
-        conv_cache = conv_cache or {}
-
+        feat_cache=None,
+        feat_idx=0,
+    ):
         hidden_states = inputs
 
         if zq is not None:
-            hidden_states, new_conv_cache["norm1"] = self.norm1(hidden_states, zq, conv_cache=conv_cache.get("norm1"))
+            hidden_states, feat_idx, feat_cache = self.norm1(hidden_states, zq, feat_cache=feat_cache, feat_idx=feat_idx)
         else:
             hidden_states = self.norm1(hidden_states)
 
         hidden_states = self.nonlinearity(hidden_states)
-        hidden_states, new_conv_cache["conv1"] = self.conv1(hidden_states, conv_cache=conv_cache.get("conv1"))
+        hidden_states, feat_idx, feat_cache = self.conv1(hidden_states, feat_cache=feat_cache, feat_idx=feat_idx)
 
         if temb is not None:
             hidden_states = hidden_states + self.temb_proj(self.nonlinearity(temb))[:, :, None, None, None]
 
         if zq is not None:
-            hidden_states, new_conv_cache["norm2"] = self.norm2(hidden_states, zq, conv_cache=conv_cache.get("norm2"))
+            hidden_states, feat_idx, feat_cache = self.norm2(hidden_states, zq, feat_cache=feat_cache, feat_idx=feat_idx)
         else:
             hidden_states = self.norm2(hidden_states)
 
         hidden_states = self.nonlinearity(hidden_states)
         hidden_states = self.dropout(hidden_states)
-        hidden_states, new_conv_cache["conv2"] = self.conv2(hidden_states, conv_cache=conv_cache.get("conv2"))
+        hidden_states, feat_idx, feat_cache = self.conv2(hidden_states, feat_cache=feat_cache, feat_idx=feat_idx)
 
         if self.in_channels != self.out_channels:
             if self.use_conv_shortcut:
-                inputs, new_conv_cache["conv_shortcut"] = self.conv_shortcut(
-                    inputs, conv_cache=conv_cache.get("conv_shortcut")
-                )
+                inputs, feat_idx, feat_cache = self.conv_shortcut(inputs, feat_cache=feat_cache, feat_idx=feat_idx)
             else:
                 inputs = self.conv_shortcut(inputs)
 
         hidden_states = hidden_states + inputs
-        return hidden_states, new_conv_cache
+        return hidden_states, feat_idx, feat_cache
 
 
 class CogVideoXDownBlock3D(nn.Module):
     r"""
     A downsampling block used in the CogVideoX model.
-
-    Args:
-        in_channels (`int`):
-            Number of input channels.
-        out_channels (`int`, *optional*):
-            Number of output channels. If None, defaults to `in_channels`.
-        temb_channels (`int`, defaults to `512`):
-            Number of time embedding channels.
-        num_layers (`int`, defaults to `1`):
-            Number of resnet layers.
-        dropout (`float`, defaults to `0.0`):
-            Dropout rate.
-        resnet_eps (`float`, defaults to `1e-6`):
-            Epsilon value for normalization layers.
-        resnet_act_fn (`str`, defaults to `"swish"`):
-            Activation function to use.
-        resnet_groups (`int`, defaults to `32`):
-            Number of groups to separate the channels into for group normalization.
-        add_downsample (`bool`, defaults to `True`):
-            Whether or not to use a downsampling layer. If not used, output dimension would be same as input dimension.
-        compress_time (`bool`, defaults to `False`):
-            Whether or not to downsample across temporal dimension.
-        pad_mode (str, defaults to `"first"`):
-            Padding mode.
+    
+    This version uses Wan-style feat_cache for TPU compatibility.
     """
 
     _supports_gradient_checkpointing = True
@@ -438,59 +413,26 @@ class CogVideoXDownBlock3D(nn.Module):
         hidden_states: torch.Tensor,
         temb: Optional[torch.Tensor] = None,
         zq: Optional[torch.Tensor] = None,
-        conv_cache: Optional[Dict[str, torch.Tensor]] = None,
-    ) -> torch.Tensor:
-        r"""Forward method of the `CogVideoXDownBlock3D` class."""
-
-        new_conv_cache = {}
-        conv_cache = conv_cache or {}
-
-        for i, resnet in enumerate(self.resnets):
-            conv_cache_key = f"resnet_{i}"
-
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                hidden_states, new_conv_cache[conv_cache_key] = self._gradient_checkpointing_func(
-                    resnet,
-                    hidden_states,
-                    temb,
-                    zq,
-                    conv_cache.get(conv_cache_key),
-                )
-            else:
-                hidden_states, new_conv_cache[conv_cache_key] = resnet(
-                    hidden_states, temb, zq, conv_cache=conv_cache.get(conv_cache_key)
-                )
+        feat_cache=None,
+        feat_idx=0,
+    ):
+        for resnet in self.resnets:
+            hidden_states, feat_idx, feat_cache = resnet(
+                hidden_states, temb, zq, feat_cache=feat_cache, feat_idx=feat_idx
+            )
 
         if self.downsamplers is not None:
             for downsampler in self.downsamplers:
                 hidden_states = downsampler(hidden_states)
 
-        return hidden_states, new_conv_cache
+        return hidden_states, feat_idx, feat_cache
 
 
 class CogVideoXMidBlock3D(nn.Module):
     r"""
     A middle block used in the CogVideoX model.
-
-    Args:
-        in_channels (`int`):
-            Number of input channels.
-        temb_channels (`int`, defaults to `512`):
-            Number of time embedding channels.
-        dropout (`float`, defaults to `0.0`):
-            Dropout rate.
-        num_layers (`int`, defaults to `1`):
-            Number of resnet layers.
-        resnet_eps (`float`, defaults to `1e-6`):
-            Epsilon value for normalization layers.
-        resnet_act_fn (`str`, defaults to `"swish"`):
-            Activation function to use.
-        resnet_groups (`int`, defaults to `32`):
-            Number of groups to separate the channels into for group normalization.
-        spatial_norm_dim (`int`, *optional*):
-            The dimension to use for spatial norm if it is to be used instead of group norm.
-        pad_mode (str, defaults to `"first"`):
-            Padding mode.
+    
+    This version uses Wan-style feat_cache for TPU compatibility.
     """
 
     _supports_gradient_checkpointing = True
@@ -533,57 +475,22 @@ class CogVideoXMidBlock3D(nn.Module):
         hidden_states: torch.Tensor,
         temb: Optional[torch.Tensor] = None,
         zq: Optional[torch.Tensor] = None,
-        conv_cache: Optional[Dict[str, torch.Tensor]] = None,
-    ) -> torch.Tensor:
-        r"""Forward method of the `CogVideoXMidBlock3D` class."""
+        feat_cache=None,
+        feat_idx=0,
+    ):
+        for resnet in self.resnets:
+            hidden_states, feat_idx, feat_cache = resnet(
+                hidden_states, temb, zq, feat_cache=feat_cache, feat_idx=feat_idx
+            )
 
-        new_conv_cache = {}
-        conv_cache = conv_cache or {}
-
-        for i, resnet in enumerate(self.resnets):
-            conv_cache_key = f"resnet_{i}"
-
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                hidden_states, new_conv_cache[conv_cache_key] = self._gradient_checkpointing_func(
-                    resnet, hidden_states, temb, zq, conv_cache.get(conv_cache_key)
-                )
-            else:
-                hidden_states, new_conv_cache[conv_cache_key] = resnet(
-                    hidden_states, temb, zq, conv_cache=conv_cache.get(conv_cache_key)
-                )
-
-        return hidden_states, new_conv_cache
+        return hidden_states, feat_idx, feat_cache
 
 
 class CogVideoXUpBlock3D(nn.Module):
     r"""
     An upsampling block used in the CogVideoX model.
-
-    Args:
-        in_channels (`int`):
-            Number of input channels.
-        out_channels (`int`, *optional*):
-            Number of output channels. If None, defaults to `in_channels`.
-        temb_channels (`int`, defaults to `512`):
-            Number of time embedding channels.
-        dropout (`float`, defaults to `0.0`):
-            Dropout rate.
-        num_layers (`int`, defaults to `1`):
-            Number of resnet layers.
-        resnet_eps (`float`, defaults to `1e-6`):
-            Epsilon value for normalization layers.
-        resnet_act_fn (`str`, defaults to `"swish"`):
-            Activation function to use.
-        resnet_groups (`int`, defaults to `32`):
-            Number of groups to separate the channels into for group normalization.
-        spatial_norm_dim (`int`, defaults to `16`):
-            The dimension to use for spatial norm if it is to be used instead of group norm.
-        add_upsample (`bool`, defaults to `True`):
-            Whether or not to use a upsampling layer. If not used, output dimension would be same as input dimension.
-        compress_time (`bool`, defaults to `False`):
-            Whether or not to downsample across temporal dimension.
-        pad_mode (str, defaults to `"first"`):
-            Padding mode.
+    
+    This version uses Wan-style feat_cache for TPU compatibility.
     """
 
     def __init__(
@@ -640,56 +547,26 @@ class CogVideoXUpBlock3D(nn.Module):
         hidden_states: torch.Tensor,
         temb: Optional[torch.Tensor] = None,
         zq: Optional[torch.Tensor] = None,
-        conv_cache: Optional[Dict[str, torch.Tensor]] = None,
-    ) -> torch.Tensor:
-        r"""Forward method of the `CogVideoXUpBlock3D` class."""
-
-        new_conv_cache = {}
-        conv_cache = conv_cache or {}
-
-        for i, resnet in enumerate(self.resnets):
-            conv_cache_key = f"resnet_{i}"
-
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                hidden_states, new_conv_cache[conv_cache_key] = self._gradient_checkpointing_func(
-                    resnet,
-                    hidden_states,
-                    temb,
-                    zq,
-                    conv_cache.get(conv_cache_key),
-                )
-            else:
-                hidden_states, new_conv_cache[conv_cache_key] = resnet(
-                    hidden_states, temb, zq, conv_cache=conv_cache.get(conv_cache_key)
-                )
+        feat_cache=None,
+        feat_idx=0,
+    ):
+        for resnet in self.resnets:
+            hidden_states, feat_idx, feat_cache = resnet(
+                hidden_states, temb, zq, feat_cache=feat_cache, feat_idx=feat_idx
+            )
 
         if self.upsamplers is not None:
             for upsampler in self.upsamplers:
                 hidden_states = upsampler(hidden_states)
 
-        return hidden_states, new_conv_cache
+        return hidden_states, feat_idx, feat_cache
 
 
 class CogVideoXEncoder3D(nn.Module):
     r"""
-    The `CogVideoXEncoder3D` layer of a variational autoencoder that encodes its input into a latent representation.
-
-    Args:
-        in_channels (`int`, *optional*, defaults to 3):
-            The number of input channels.
-        out_channels (`int`, *optional*, defaults to 3):
-            The number of output channels.
-        down_block_types (`Tuple[str, ...]`, *optional*, defaults to `("DownEncoderBlock2D",)`):
-            The types of down blocks to use. See `~diffusers.models.unet_2d_blocks.get_down_block` for available
-            options.
-        block_out_channels (`Tuple[int, ...]`, *optional*, defaults to `(64,)`):
-            The number of output channels for each block.
-        act_fn (`str`, *optional*, defaults to `"silu"`):
-            The activation function to use. See `~diffusers.models.activations.get_activation` for available options.
-        layers_per_block (`int`, *optional*, defaults to 2):
-            The number of layers per block.
-        norm_num_groups (`int`, *optional*, defaults to 32):
-            The number of groups for normalization.
+    The `CogVideoXEncoder3D` layer of a variational autoencoder.
+    
+    This version uses Wan-style feat_cache for TPU compatibility.
     """
 
     _supports_gradient_checkpointing = True
@@ -771,77 +648,37 @@ class CogVideoXEncoder3D(nn.Module):
         self,
         sample: torch.Tensor,
         temb: Optional[torch.Tensor] = None,
-        conv_cache: Optional[Dict[str, torch.Tensor]] = None,
-    ) -> torch.Tensor:
-        r"""The forward method of the `CogVideoXEncoder3D` class."""
+        feat_cache=None,
+    ):
+        feat_idx = 0
+        
+        hidden_states, feat_idx, feat_cache = self.conv_in(sample, feat_cache=feat_cache, feat_idx=feat_idx)
 
-        new_conv_cache = {}
-        conv_cache = conv_cache or {}
-
-        hidden_states, new_conv_cache["conv_in"] = self.conv_in(sample, conv_cache=conv_cache.get("conv_in"))
-
-        if torch.is_grad_enabled() and self.gradient_checkpointing:
-            # 1. Down
-            for i, down_block in enumerate(self.down_blocks):
-                conv_cache_key = f"down_block_{i}"
-                hidden_states, new_conv_cache[conv_cache_key] = self._gradient_checkpointing_func(
-                    down_block,
-                    hidden_states,
-                    temb,
-                    None,
-                    conv_cache.get(conv_cache_key),
-                )
-
-            # 2. Mid
-            hidden_states, new_conv_cache["mid_block"] = self._gradient_checkpointing_func(
-                self.mid_block,
-                hidden_states,
-                temb,
-                None,
-                conv_cache.get("mid_block"),
+        # 1. Down
+        for down_block in self.down_blocks:
+            hidden_states, feat_idx, feat_cache = down_block(
+                hidden_states, temb, None, feat_cache=feat_cache, feat_idx=feat_idx
             )
-        else:
-            # 1. Down
-            for i, down_block in enumerate(self.down_blocks):
-                conv_cache_key = f"down_block_{i}"
-                hidden_states, new_conv_cache[conv_cache_key] = down_block(
-                    hidden_states, temb, None, conv_cache.get(conv_cache_key)
-                )
 
-            # 2. Mid
-            hidden_states, new_conv_cache["mid_block"] = self.mid_block(
-                hidden_states, temb, None, conv_cache=conv_cache.get("mid_block")
-            )
+        # 2. Mid
+        hidden_states, feat_idx, feat_cache = self.mid_block(
+            hidden_states, temb, None, feat_cache=feat_cache, feat_idx=feat_idx
+        )
 
         # 3. Post-process
         hidden_states = self.norm_out(hidden_states)
         hidden_states = self.conv_act(hidden_states)
 
-        hidden_states, new_conv_cache["conv_out"] = self.conv_out(hidden_states, conv_cache=conv_cache.get("conv_out"))
+        hidden_states, feat_idx, feat_cache = self.conv_out(hidden_states, feat_cache=feat_cache, feat_idx=feat_idx)
 
-        return hidden_states, new_conv_cache
+        return hidden_states, feat_cache
 
 
 class CogVideoXDecoder3D(nn.Module):
     r"""
-    The `CogVideoXDecoder3D` layer of a variational autoencoder that decodes its latent representation into an output
-    sample.
-
-    Args:
-        in_channels (`int`, *optional*, defaults to 3):
-            The number of input channels.
-        out_channels (`int`, *optional*, defaults to 3):
-            The number of output channels.
-        up_block_types (`Tuple[str, ...]`, *optional*, defaults to `("UpDecoderBlock2D",)`):
-            The types of up blocks to use. See `~diffusers.models.unet_2d_blocks.get_up_block` for available options.
-        block_out_channels (`Tuple[int, ...]`, *optional*, defaults to `(64,)`):
-            The number of output channels for each block.
-        act_fn (`str`, *optional*, defaults to `"silu"`):
-            The activation function to use. See `~diffusers.models.activations.get_activation` for available options.
-        layers_per_block (`int`, *optional*, defaults to 2):
-            The number of layers per block.
-        norm_num_groups (`int`, *optional*, defaults to 32):
-            The number of groups for normalization.
+    The `CogVideoXDecoder3D` layer of a variational autoencoder.
+    
+    This version uses Wan-style feat_cache for TPU compatibility.
     """
 
     _supports_gradient_checkpointing = True
@@ -930,92 +767,42 @@ class CogVideoXDecoder3D(nn.Module):
         self,
         sample: torch.Tensor,
         temb: Optional[torch.Tensor] = None,
-        conv_cache: Optional[Dict[str, torch.Tensor]] = None,
-    ) -> torch.Tensor:
-        r"""The forward method of the `CogVideoXDecoder3D` class."""
+        feat_cache=None,
+    ):
+        feat_idx = 0
+        
+        hidden_states, feat_idx, feat_cache = self.conv_in(sample, feat_cache=feat_cache, feat_idx=feat_idx)
 
-        new_conv_cache = {}
-        conv_cache = conv_cache or {}
+        # 1. Mid
+        hidden_states, feat_idx, feat_cache = self.mid_block(
+            hidden_states, temb, sample, feat_cache=feat_cache, feat_idx=feat_idx
+        )
 
-        hidden_states, new_conv_cache["conv_in"] = self.conv_in(sample, conv_cache=conv_cache.get("conv_in"))
-
-        if torch.is_grad_enabled() and self.gradient_checkpointing:
-            # 1. Mid
-            hidden_states, new_conv_cache["mid_block"] = self._gradient_checkpointing_func(
-                self.mid_block,
-                hidden_states,
-                temb,
-                sample,
-                conv_cache.get("mid_block"),
+        # 2. Up
+        for up_block in self.up_blocks:
+            hidden_states, feat_idx, feat_cache = up_block(
+                hidden_states, temb, sample, feat_cache=feat_cache, feat_idx=feat_idx
             )
-
-            # 2. Up
-            for i, up_block in enumerate(self.up_blocks):
-                conv_cache_key = f"up_block_{i}"
-                hidden_states, new_conv_cache[conv_cache_key] = self._gradient_checkpointing_func(
-                    up_block,
-                    hidden_states,
-                    temb,
-                    sample,
-                    conv_cache.get(conv_cache_key),
-                )
-        else:
-            # 1. Mid
-            hidden_states, new_conv_cache["mid_block"] = self.mid_block(
-                hidden_states, temb, sample, conv_cache=conv_cache.get("mid_block")
-            )
-
-            # 2. Up
-            for i, up_block in enumerate(self.up_blocks):
-                conv_cache_key = f"up_block_{i}"
-                hidden_states, new_conv_cache[conv_cache_key] = up_block(
-                    hidden_states, temb, sample, conv_cache=conv_cache.get(conv_cache_key)
-                )
 
         # 3. Post-process
-        hidden_states, new_conv_cache["norm_out"] = self.norm_out(
-            hidden_states, sample, conv_cache=conv_cache.get("norm_out")
+        hidden_states, feat_idx, feat_cache = self.norm_out(
+            hidden_states, sample, feat_cache=feat_cache, feat_idx=feat_idx
         )
         hidden_states = self.conv_act(hidden_states)
-        hidden_states, new_conv_cache["conv_out"] = self.conv_out(hidden_states, conv_cache=conv_cache.get("conv_out"))
+        hidden_states, feat_idx, feat_cache = self.conv_out(hidden_states, feat_cache=feat_cache, feat_idx=feat_idx)
 
         # Replicate back to every devices, for the video processing after decode
         # With multihost, if the data still in other host, there is non-addressable devices error.
         hidden_states = mark_sharding(hidden_states, P())
 
-        return hidden_states, new_conv_cache
+        return hidden_states, feat_cache
 
 
 class AutoencoderKLCogVideoX(ModelMixin, AutoencoderMixin, ConfigMixin, FromOriginalModelMixin):
     r"""
-    A VAE model with KL loss for encoding images into latents and decoding latent representations into images. Used in
-    [CogVideoX](https://github.com/THUDM/CogVideo).
-
-    This model inherits from [`ModelMixin`]. Check the superclass documentation for it's generic methods implemented
-    for all models (such as downloading or saving).
-
-    Parameters:
-        in_channels (int, *optional*, defaults to 3): Number of channels in the input image.
-        out_channels (int,  *optional*, defaults to 3): Number of channels in the output.
-        down_block_types (`Tuple[str]`, *optional*, defaults to `("DownEncoderBlock2D",)`):
-            Tuple of downsample block types.
-        up_block_types (`Tuple[str]`, *optional*, defaults to `("UpDecoderBlock2D",)`):
-            Tuple of upsample block types.
-        block_out_channels (`Tuple[int]`, *optional*, defaults to `(64,)`):
-            Tuple of block output channels.
-        act_fn (`str`, *optional*, defaults to `"silu"`): The activation function to use.
-        sample_size (`int`, *optional*, defaults to `32`): Sample input size.
-        scaling_factor (`float`, *optional*, defaults to `1.15258426`):
-            The component-wise standard deviation of the trained latent space computed using the first batch of the
-            training set. This is used to scale the latent space to have unit variance when training the diffusion
-            model. The latents are scaled with the formula `z = z * scaling_factor` before being passed to the
-            diffusion model. When decoding, the latents are scaled back to the original scale with the formula: `z = 1
-            / scaling_factor * z`. For more details, refer to sections 4.3.2 and D.1 of the [High-Resolution Image
-            Synthesis with Latent Diffusion Models](https://huggingface.co/papers/2112.10752) paper.
-        force_upcast (`bool`, *optional*, default to `True`):
-            If enabled it will force the VAE to run in float32 for high image resolution pipelines, such as SD-XL. VAE
-            can be fine-tuned / trained to a lower range without losing too much precision in which case `force_upcast`
-            can be set to `False` - see: https://huggingface.co/madebyollin/sdxl-vae-fp16-fix
+    A VAE model with KL loss for encoding images into latents and decoding latent representations into images.
+    
+    This version uses Wan-style feat_cache for TPU compatibility.
     """
 
     _supports_gradient_checkpointing = True
@@ -1086,26 +873,9 @@ class AutoencoderKLCogVideoX(ModelMixin, AutoencoderMixin, ConfigMixin, FromOrig
         self.use_slicing = False
         self.use_tiling = False
 
-        # Can be increased to decode more latent frames at once, but comes at a reasonable memory cost and it is not
-        # recommended because the temporal parts of the VAE, here, are tricky to understand.
-        # If you decode X latent frames together, the number of output frames is:
-        #     (X + (2 conv cache) + (2 time upscale_1) + (4 time upscale_2) - (2 causal conv downscale)) => X + 6 frames
-        #
-        # Example with num_latent_frames_batch_size = 2:
-        #     - 12 latent frames: (0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11) are processed together
-        #         => (12 // 2 frame slices) * ((2 num_latent_frames_batch_size) + (2 conv cache) + (2 time upscale_1) + (4 time upscale_2) - (2 causal conv downscale))
-        #         => 6 * 8 = 48 frames
-        #     - 13 latent frames: (0, 1, 2) (special case), (3, 4), (5, 6), (7, 8), (9, 10), (11, 12) are processed together
-        #         => (1 frame slice) * ((3 num_latent_frames_batch_size) + (2 conv cache) + (2 time upscale_1) + (4 time upscale_2) - (2 causal conv downscale)) +
-        #            ((13 - 3) // 2) * ((2 num_latent_frames_batch_size) + (2 conv cache) + (2 time upscale_1) + (4 time upscale_2) - (2 causal conv downscale))
-        #         => 1 * 9 + 5 * 8 = 49 frames
-        # It has been implemented this way so as to not have "magic values" in the code base that would be hard to explain. Note that
-        # setting it to anything other than 2 would give poor results because the VAE hasn't been trained to be adaptive with different
-        # number of temporal frames.
         self.num_latent_frames_batch_size = 2
         self.num_sample_frames_batch_size = 8
 
-        # We make the minimum height and width of sample for tiling half that of the generally supported
         self.tile_sample_min_height = sample_height // 2
         self.tile_sample_min_width = sample_width // 2
         self.tile_latent_min_height = int(
@@ -1113,11 +883,30 @@ class AutoencoderKLCogVideoX(ModelMixin, AutoencoderMixin, ConfigMixin, FromOrig
         )
         self.tile_latent_min_width = int(self.tile_sample_min_width / (2 ** (len(self.config.block_out_channels) - 1)))
 
-        # These are experimental overlap factors that were chosen based on experimentation and seem to work best for
-        # 720x480 (WxH) resolution. The above resolution is the strongly recommended generation resolution in CogVideoX
-        # and so the tiling implementation has only been tested on those specific resolutions.
         self.tile_overlap_factor_height = 1 / 6
         self.tile_overlap_factor_width = 1 / 5
+
+        # Precompute and cache conv counts for encoder and decoder for clear_cache speedup
+        self._cached_conv_counts = {
+            "decoder": self._count_causal_conv3d(self.decoder) if self.decoder is not None else 0,
+            "encoder": self._count_causal_conv3d(self.encoder) if self.encoder is not None else 0,
+        }
+
+    def _count_causal_conv3d(self, module):
+        """Count the number of CogVideoXCausalConv3d layers in a module."""
+        count = 0
+        for m in module.modules():
+            if isinstance(m, CogVideoXCausalConv3d):
+                count += 1
+        return count
+
+    def clear_cache(self):
+        """Initialize feat_cache for decoder and encoder."""
+        self._conv_num = self._cached_conv_counts["decoder"]
+        self._feat_map = [None] * self._conv_num
+        # cache encode
+        self._enc_conv_num = self._cached_conv_counts["encoder"]
+        self._enc_feat_map = [None] * self._enc_conv_num
 
     def enable_tiling(
         self,
@@ -1126,25 +915,6 @@ class AutoencoderKLCogVideoX(ModelMixin, AutoencoderMixin, ConfigMixin, FromOrig
         tile_overlap_factor_height: Optional[float] = None,
         tile_overlap_factor_width: Optional[float] = None,
     ) -> None:
-        r"""
-        Enable tiled VAE decoding. When this option is enabled, the VAE will split the input tensor into tiles to
-        compute decoding and encoding in several steps. This is useful for saving a large amount of memory and to allow
-        processing larger images.
-
-        Args:
-            tile_sample_min_height (`int`, *optional*):
-                The minimum height required for a sample to be separated into tiles across the height dimension.
-            tile_sample_min_width (`int`, *optional*):
-                The minimum width required for a sample to be separated into tiles across the width dimension.
-            tile_overlap_factor_height (`int`, *optional*):
-                The minimum amount of overlap between two consecutive vertical tiles. This is to ensure that there are
-                no tiling artifacts produced across the height dimension. Must be between 0 and 1. Setting a higher
-                value might cause more tiles to be processed leading to slow down of the decoding process.
-            tile_overlap_factor_width (`int`, *optional*):
-                The minimum amount of overlap between two consecutive horizontal tiles. This is to ensure that there
-                are no tiling artifacts produced across the width dimension. Must be between 0 and 1. Setting a higher
-                value might cause more tiles to be processed leading to slow down of the decoding process.
-        """
         self.use_tiling = True
         self.tile_sample_min_height = tile_sample_min_height or self.tile_sample_min_height
         self.tile_sample_min_width = tile_sample_min_width or self.tile_sample_min_width
@@ -1155,17 +925,24 @@ class AutoencoderKLCogVideoX(ModelMixin, AutoencoderMixin, ConfigMixin, FromOrig
         self.tile_overlap_factor_height = tile_overlap_factor_height or self.tile_overlap_factor_height
         self.tile_overlap_factor_width = tile_overlap_factor_width or self.tile_overlap_factor_width
 
+    def disable_tiling(self) -> None:
+        self.use_tiling = False
+
+    def enable_slicing(self) -> None:
+        self.use_slicing = True
+
+    def disable_slicing(self) -> None:
+        self.use_slicing = False
+
     def _encode(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, num_channels, num_frames, height, width = x.shape
 
         if self.use_tiling and (width > self.tile_sample_min_width or height > self.tile_sample_min_height):
             return self.tiled_encode(x)
 
+        self.clear_cache()
         frame_batch_size = self.num_sample_frames_batch_size
-        # Note: We expect the number of frames to be either `1` or `frame_batch_size * k` or `frame_batch_size * k + 1` for some k.
-        # As the extra single frame is handled inside the loop, it is not required to round up here.
         num_batches = max(num_frames // frame_batch_size, 1)
-        conv_cache = None
         enc = []
 
         for i in range(num_batches):
@@ -1173,30 +950,19 @@ class AutoencoderKLCogVideoX(ModelMixin, AutoencoderMixin, ConfigMixin, FromOrig
             start_frame = frame_batch_size * i + (0 if i == 0 else remaining_frames)
             end_frame = frame_batch_size * (i + 1) + remaining_frames
             x_intermediate = x[:, :, start_frame:end_frame]
-            x_intermediate, conv_cache = self.encoder(x_intermediate, conv_cache=conv_cache)
+            x_intermediate, self._enc_feat_map = self.encoder(x_intermediate, feat_cache=self._enc_feat_map)
             if self.quant_conv is not None:
                 x_intermediate = self.quant_conv(x_intermediate)
             enc.append(x_intermediate)
 
         enc = torch.cat(enc, dim=2)
+        self.clear_cache()
         return enc
 
     @apply_forward_hook
     def encode(
         self, x: torch.Tensor, return_dict: bool = True
     ) -> Union[AutoencoderKLOutput, Tuple[DiagonalGaussianDistribution]]:
-        """
-        Encode a batch of images into latents.
-
-        Args:
-            x (`torch.Tensor`): Input batch of images.
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether to return a [`~models.autoencoder_kl.AutoencoderKLOutput`] instead of a plain tuple.
-
-        Returns:
-                The latent representations of the encoded videos. If `return_dict` is True, a
-                [`~models.autoencoder_kl.AutoencoderKLOutput`] is returned, otherwise a plain `tuple` is returned.
-        """
         if self.use_slicing and x.shape[0] > 1:
             encoded_slices = [self._encode(x_slice) for x_slice in x.split(1)]
             h = torch.cat(encoded_slices)
@@ -1215,9 +981,9 @@ class AutoencoderKLCogVideoX(ModelMixin, AutoencoderMixin, ConfigMixin, FromOrig
         if self.use_tiling and (width > self.tile_latent_min_width or height > self.tile_latent_min_height):
             return self.tiled_decode(z, return_dict=return_dict)
 
+        self.clear_cache()
         frame_batch_size = self.num_latent_frames_batch_size
         num_batches = max(num_frames // frame_batch_size, 1)
-        conv_cache = None
         dec = []
 
         for i in range(num_batches):
@@ -1227,10 +993,11 @@ class AutoencoderKLCogVideoX(ModelMixin, AutoencoderMixin, ConfigMixin, FromOrig
             z_intermediate = z[:, :, start_frame:end_frame]
             if self.post_quant_conv is not None:
                 z_intermediate = self.post_quant_conv(z_intermediate)
-            z_intermediate, conv_cache = self.decoder(z_intermediate, conv_cache=conv_cache)
+            z_intermediate, self._feat_map = self.decoder(z_intermediate, feat_cache=self._feat_map)
             dec.append(z_intermediate)
 
         dec = torch.cat(dec, dim=2)
+        self.clear_cache()
 
         if not return_dict:
             return (dec,)
@@ -1239,19 +1006,6 @@ class AutoencoderKLCogVideoX(ModelMixin, AutoencoderMixin, ConfigMixin, FromOrig
 
     @apply_forward_hook
     def decode(self, z: torch.Tensor, return_dict: bool = True) -> Union[DecoderOutput, torch.Tensor]:
-        """
-        Decode a batch of images.
-
-        Args:
-            z (`torch.Tensor`): Input batch of latent vectors.
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether to return a [`~models.vae.DecoderOutput`] instead of a plain tuple.
-
-        Returns:
-            [`~models.vae.DecoderOutput`] or `tuple`:
-                If return_dict is True, a [`~models.vae.DecoderOutput`] is returned, otherwise a plain `tuple` is
-                returned.
-        """
         if self.use_slicing and z.shape[0] > 1:
             decoded_slices = [self._decode(z_slice).sample for z_slice in z.split(1)]
             decoded = torch.cat(decoded_slices)
@@ -1279,22 +1033,6 @@ class AutoencoderKLCogVideoX(ModelMixin, AutoencoderMixin, ConfigMixin, FromOrig
         return b
 
     def tiled_encode(self, x: torch.Tensor) -> torch.Tensor:
-        r"""Encode a batch of images using a tiled encoder.
-
-        When this option is enabled, the VAE will split the input tensor into tiles to compute encoding in several
-        steps. This is useful to keep memory use constant regardless of image size. The end result of tiled encoding is
-        different from non-tiled encoding because each tile uses a different encoder. To avoid tiling artifacts, the
-        tiles overlap and are blended together to form a smooth output. You may still see tile-sized changes in the
-        output, but they should be much less noticeable.
-
-        Args:
-            x (`torch.Tensor`): Input batch of videos.
-
-        Returns:
-            `torch.Tensor`:
-                The latent representation of the encoded videos.
-        """
-        # For a rough memory estimate, take a look at the `tiled_decode` method.
         batch_size, num_channels, num_frames, height, width = x.shape
 
         overlap_height = int(self.tile_sample_min_height * (1 - self.tile_overlap_factor_height))
@@ -1305,16 +1043,12 @@ class AutoencoderKLCogVideoX(ModelMixin, AutoencoderMixin, ConfigMixin, FromOrig
         row_limit_width = self.tile_latent_min_width - blend_extent_width
         frame_batch_size = self.num_sample_frames_batch_size
 
-        # Split x into overlapping tiles and encode them separately.
-        # The tiles have an overlap to avoid seams between tiles.
         rows = []
         for i in range(0, height, overlap_height):
             row = []
             for j in range(0, width, overlap_width):
-                # Note: We expect the number of frames to be either `1` or `frame_batch_size * k` or `frame_batch_size * k + 1` for some k.
-                # As the extra single frame is handled inside the loop, it is not required to round up here.
                 num_batches = max(num_frames // frame_batch_size, 1)
-                conv_cache = None
+                self.clear_cache()
                 time = []
 
                 for k in range(num_batches):
@@ -1328,20 +1062,19 @@ class AutoencoderKLCogVideoX(ModelMixin, AutoencoderMixin, ConfigMixin, FromOrig
                         i : i + self.tile_sample_min_height,
                         j : j + self.tile_sample_min_width,
                     ]
-                    tile, conv_cache = self.encoder(tile, conv_cache=conv_cache)
+                    tile, self._enc_feat_map = self.encoder(tile, feat_cache=self._enc_feat_map)
                     if self.quant_conv is not None:
                         tile = self.quant_conv(tile)
                     time.append(tile)
 
                 row.append(torch.cat(time, dim=2))
             rows.append(row)
+        self.clear_cache()
 
         result_rows = []
         for i, row in enumerate(rows):
             result_row = []
             for j, tile in enumerate(row):
-                # blend the above tile and the left tile
-                # to the current tile and add the current tile to the result row
                 if i > 0:
                     tile = self.blend_v(rows[i - 1][j], tile, blend_extent_height)
                 if j > 0:
@@ -1353,29 +1086,6 @@ class AutoencoderKLCogVideoX(ModelMixin, AutoencoderMixin, ConfigMixin, FromOrig
         return enc
 
     def tiled_decode(self, z: torch.Tensor, return_dict: bool = True) -> Union[DecoderOutput, torch.Tensor]:
-        r"""
-        Decode a batch of images using a tiled decoder.
-
-        Args:
-            z (`torch.Tensor`): Input batch of latent vectors.
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`~models.vae.DecoderOutput`] instead of a plain tuple.
-
-        Returns:
-            [`~models.vae.DecoderOutput`] or `tuple`:
-                If return_dict is True, a [`~models.vae.DecoderOutput`] is returned, otherwise a plain `tuple` is
-                returned.
-        """
-        # Rough memory assessment:
-        #   - In CogVideoX-2B, there are a total of 24 CausalConv3d layers.
-        #   - The biggest intermediate dimensions are: [1, 128, 9, 480, 720].
-        #   - Assume fp16 (2 bytes per value).
-        # Memory required: 1 * 128 * 9 * 480 * 720 * 24 * 2 / 1024**3 = 17.8 GB
-        #
-        # Memory assessment when using tiling:
-        #   - Assume everything as above but now HxW is 240x360 by tiling in half
-        # Memory required: 1 * 128 * 9 * 240 * 360 * 24 * 2 / 1024**3 = 4.5 GB
-
         batch_size, num_channels, num_frames, height, width = z.shape
 
         overlap_height = int(self.tile_latent_min_height * (1 - self.tile_overlap_factor_height))
@@ -1386,14 +1096,12 @@ class AutoencoderKLCogVideoX(ModelMixin, AutoencoderMixin, ConfigMixin, FromOrig
         row_limit_width = self.tile_sample_min_width - blend_extent_width
         frame_batch_size = self.num_latent_frames_batch_size
 
-        # Split z into overlapping tiles and decode them separately.
-        # The tiles have an overlap to avoid seams between tiles.
         rows = []
         for i in range(0, height, overlap_height):
             row = []
             for j in range(0, width, overlap_width):
                 num_batches = max(num_frames // frame_batch_size, 1)
-                conv_cache = None
+                self.clear_cache()
                 time = []
 
                 for k in range(num_batches):
@@ -1409,18 +1117,17 @@ class AutoencoderKLCogVideoX(ModelMixin, AutoencoderMixin, ConfigMixin, FromOrig
                     ]
                     if self.post_quant_conv is not None:
                         tile = self.post_quant_conv(tile)
-                    tile, conv_cache = self.decoder(tile, conv_cache=conv_cache)
+                    tile, self._feat_map = self.decoder(tile, feat_cache=self._feat_map)
                     time.append(tile)
 
                 row.append(torch.cat(time, dim=2))
             rows.append(row)
+        self.clear_cache()
 
         result_rows = []
         for i, row in enumerate(rows):
             result_row = []
             for j, tile in enumerate(row):
-                # blend the above tile and the left tile
-                # to the current tile and add the current tile to the result row
                 if i > 0:
                     tile = self.blend_v(rows[i - 1][j], tile, blend_extent_height)
                 if j > 0:
