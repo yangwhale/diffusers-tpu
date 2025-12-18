@@ -23,7 +23,7 @@ from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModel, UMT
 from ...callbacks import MultiPipelineCallbacks, PipelineCallback
 from ...image_processor import PipelineImageInput
 from ...loaders import WanLoraLoaderMixin
-from ...models.autoencoders.autoencoder_kl_wan_flax import AutoencoderKLWan
+from ...models.autoencoders.autoencoder_kl_wan_torchax import AutoencoderKLWan
 from ...models.transformers.transformer_wan_flax import WanTransformer3DModel
 from ...schedulers import FlowMatchEulerDiscreteScheduler
 from ...utils import is_ftfy_available, is_torch_xla_available, logging, replace_example_docstring
