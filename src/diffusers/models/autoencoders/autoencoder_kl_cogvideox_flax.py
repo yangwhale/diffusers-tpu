@@ -230,7 +230,7 @@ class FlaxCogVideoXCausalConv3d(nnx.Module):
         inputs: jnp.ndarray,
         conv_cache: Optional[jnp.ndarray] = None,
         feat_cache: Optional[list] = None,
-        feat_idx: Optional[list] = None,
+        feat_idx: int = 0,
     ):
         """
         前向传播，支持两种缓存模式：
@@ -241,41 +241,45 @@ class FlaxCogVideoXCausalConv3d(nnx.Module):
             inputs: 输入张量 (B, T, H, W, C)
             conv_cache: 旧模式的缓存（已弃用）
             feat_cache: 缓存列表（新模式）
-            feat_idx: 当前索引列表（新模式）
+            feat_idx: 当前索引（新模式）
             
         Returns:
             output: 卷积输出
-            new_cache: 更新的缓存（仅在旧模式下使用）
+            feat_idx: 更新后的索引
+            feat_cache: 更新后的缓存
         """
         # 新模式：使用 feat_cache/feat_idx 进行逐帧解码
-        if feat_cache is not None and feat_idx is not None:
+        if feat_cache is not None:
             return self._call_with_feat_cache(inputs, feat_cache, feat_idx)
         
         # 旧模式：使用 conv_cache（保持向后兼容）
-        return self._call_with_conv_cache(inputs, conv_cache)
+        output, conv_cache = self._call_with_conv_cache(inputs, conv_cache)
+        return output, feat_idx, feat_cache
     
     def _call_with_feat_cache(
         self,
         inputs: jnp.ndarray,
         feat_cache: list,
-        feat_idx: list,
+        feat_idx: int,
     ):
         """
-        使用 feat_cache 的新缓存模式（参考 WanCausalConv3d）。
+        使用 feat_cache 的缓存模式（严格对齐 TorchAx CogVideoXCausalConv3d.forward）。
+        
+        此方法与 TorchAx 版本 autoencoder_kl_cogvideox_torchax.py:163-208 完全一致，
+        唯一区别是维度顺序：TorchAx 是 NCTHW（时间在 dim=2），Flax 是 NTHWC（时间在 dim=1）。
         
         Args:
-            inputs: 输入张量 (B, T, H, W, C)，通常 T=1（逐帧处理）
+            inputs: 输入张量 (B, T, H, W, C)，通常 T=2（逐批次处理）
             feat_cache: 缓存列表
-            feat_idx: 当前索引列表 [idx]
+            feat_idx: 当前索引
             
         Returns:
             output: 卷积输出
+            feat_idx: 更新后的索引
+            feat_cache: 更新后的缓存
         """
-        idx = feat_idx[0]
-        
-        # 处理时间填充
         if self.pad_mode == "replicate":
-            # Replicate 模式：直接填充
+            # Replicate 模式：直接填充（与 TorchAx 相同）
             pad_width = [
                 (0, 0),  # batch
                 (self.time_pad, 0),  # time (only pad before, causal)
@@ -283,67 +287,53 @@ class FlaxCogVideoXCausalConv3d(nnx.Module):
                 (self.width_pad, self.width_pad),  # width
                 (0, 0),  # channels
             ]
-            x = jnp.pad(inputs, pad_width, mode='edge')
+            inputs = jnp.pad(inputs, pad_width, mode='edge')
+            output = self.conv(inputs)
+            return output, feat_idx, feat_cache
         else:
-            # Constant 模式：使用缓存（参考 WAN 的实现）
-            if self.time_kernel_size > 1:
-                padding_needed = self.time_kernel_size - 1  # 需要的 padding 帧数
+            # Constant 模式：使用 feat_cache（严格对齐 TorchAx）
+            kernel_size = self.time_kernel_size
+            if kernel_size > 1:
+                idx = feat_idx
                 
-                # 如果缓存中有数据，使用它
+                # ⚠️ TorchAx 核心逻辑 #1：在拼接前先保存 cache_x
+                # TorchAx: cache_x = inputs[:, :, -CACHE_T:, :, :].clone()
+                # Flax (NTHWC): cache_x = inputs[:, -CACHE_T:, :, :, :]
+                cache_x = inputs[:, -self.CACHE_T:, :, :, :]
+                
+                # ⚠️ TorchAx 核心逻辑 #2：处理 cache_x 不足 2 帧的情况
+                # TorchAx: if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
+                # Flax (NTHWC): if cache_x.shape[1] < 2 and feat_cache[idx] is not None:
+                if cache_x.shape[1] < 2 and feat_cache[idx] is not None:
+                    # TorchAx: cache_x = torch.cat([feat_cache[idx][:, :, -1, :, :].unsqueeze(2), cache_x], dim=2)
+                    # Flax: 拼接旧缓存最后一帧 + 当前 cache_x
+                    cache_x = jnp.concatenate([
+                        feat_cache[idx][:, -1:, :, :, :],  # 旧缓存最后一帧
+                        cache_x
+                    ], axis=1)
+                
+                # ⚠️ TorchAx 核心逻辑 #3：拼接缓存和输入
                 if feat_cache[idx] is not None:
-                    cache_len = feat_cache[idx].shape[1]
-                    # 拼接缓存和当前输入
-                    x = jnp.concatenate([feat_cache[idx], inputs], axis=1)
-                    
-                    # 调整还需要的 padding
-                    padding_needed -= cache_len
-                    if padding_needed > 0:
-                        # 缓存不够，补充额外的 padding
-                        extra_padding = jnp.tile(x[:, :1, :, :, :], (1, padding_needed, 1, 1, 1))
-                        x = jnp.concatenate([extra_padding, x], axis=1)
-                    elif padding_needed < 0:
-                        # 缓存太多，裁剪
-                        x = x[:, -padding_needed:, ...]
+                    # TorchAx: inputs = torch.cat([feat_cache[idx], inputs], dim=2)
+                    inputs = jnp.concatenate([feat_cache[idx], inputs], axis=1)
                 else:
                     # 第一次调用：重复第一帧作为填充
-                    padding_frames = jnp.tile(
+                    # TorchAx: cached_inputs = inputs[:, :, :1].repeat(1, 1, kernel_size - 1, 1, 1)
+                    cached_inputs = jnp.tile(
                         inputs[:, :1, :, :, :],
-                        (1, padding_needed, 1, 1, 1)
+                        (1, kernel_size - 1, 1, 1, 1)
                     )
-                    x = jnp.concatenate([padding_frames, inputs], axis=1)
+                    # TorchAx: inputs = torch.cat([cached_inputs, inputs], dim=2)
+                    inputs = jnp.concatenate([cached_inputs, inputs], axis=1)
                 
-                # ⚠️ 关键修复：缓存更新逻辑（严格参考 WAN 第 432-436 行）
-                # 必须使用卷积后的结果 x2（而非原始 inputs）来更新缓存
-                # 先执行卷积，获取输出
-                x2 = self.conv(x)
-                
-                # 更新缓存：从拼接后的 x（卷积前）保存最后 CACHE_T 帧
-                if inputs.shape[1] < self.CACHE_T and feat_cache[idx] is not None:
-                    # inputs 不足 2 帧：从旧缓存取最后 1 帧 + inputs 的全部帧
-                    feat_cache[idx] = jnp.concatenate([
-                        jnp.expand_dims(feat_cache[idx][:, -1, :, :, :], axis=1),
-                        inputs[:, -self.CACHE_T:, :, :, :]
-                    ], axis=1)
-                else:
-                    # inputs 足够：直接取 inputs 的最后 CACHE_T 帧
-                    feat_cache[idx] = inputs[:, -self.CACHE_T:, :, :, :]
-                
-                # 索引递增
-                feat_idx[0] += 1
-                
-                # 返回卷积输出
-                return x2, None
-            else:
-                x = inputs
-        
-        # 执行卷积（非缓存路径）
-        output = self.conv(x)
-        
-        # 索引递增
-        feat_idx[0] += 1
-        
-        # 旧 API 兼容性：返回 (output, None)
-        return output, None
+                # ⚠️ TorchAx 核心逻辑 #4：保存新缓存（在拼接后立即保存）
+                # TorchAx: feat_cache[idx] = cache_x
+                feat_cache[idx] = cache_x
+                feat_idx += 1
+            
+            # 执行卷积
+            output = self.conv(inputs)
+            return output, feat_idx, feat_cache
     
     def _call_with_conv_cache(self, inputs: jnp.ndarray, conv_cache: Optional[jnp.ndarray]):
         """
@@ -559,7 +549,7 @@ class FlaxCogVideoXSpatialNorm3D(nnx.Module):
         zq: jnp.ndarray,
         conv_cache: Optional[Dict[str, jnp.ndarray]] = None,
         feat_cache: Optional[list] = None,
-        feat_idx: Optional[list] = None,
+        feat_idx: int = 0,
     ):
         """
         Apply spatial normalization with conditioning.
@@ -573,25 +563,27 @@ class FlaxCogVideoXSpatialNorm3D(nnx.Module):
             zq: Conditioning latent of shape (B, T', H', W', C')
             conv_cache: 旧模式的缓存字典
             feat_cache: 新模式的缓存列表
-            feat_idx: 新模式的索引列表
+            feat_idx: 新模式的索引
             
         Returns:
             Normalized and conditioned features
-            Updated cache (conv_cache dict 或 None)
+            feat_idx: 更新后的索引
+            feat_cache: 更新后的缓存
         """
         # 新模式：使用 feat_cache/feat_idx
-        if feat_cache is not None and feat_idx is not None:
+        if feat_cache is not None:
             return self._call_with_feat_cache(f, zq, feat_cache, feat_idx)
         
         # 旧模式：使用 conv_cache
-        return self._call_with_conv_cache(f, zq, conv_cache)
+        output, conv_cache = self._call_with_conv_cache(f, zq, conv_cache)
+        return output, feat_idx, feat_cache
     
     def _call_with_feat_cache(
         self,
         f: jnp.ndarray,
         zq: jnp.ndarray,
         feat_cache: list,
-        feat_idx: list,
+        feat_idx: int,
     ):
         """新缓存模式的实现"""
         # Handle odd frame counts specially (matching PyTorch implementation)
@@ -614,14 +606,14 @@ class FlaxCogVideoXSpatialNorm3D(nnx.Module):
             zq = jax.image.resize(zq, (B, T, H, W, zq.shape[-1]), method='nearest')
         
         # Apply conditioning convolutions with feat_cache
-        conv_y, _ = self.conv_y(zq, feat_cache=feat_cache, feat_idx=feat_idx)
-        conv_b, _ = self.conv_b(zq, feat_cache=feat_cache, feat_idx=feat_idx)
+        conv_y, feat_idx, feat_cache = self.conv_y(zq, feat_cache=feat_cache, feat_idx=feat_idx)
+        conv_b, feat_idx, feat_cache = self.conv_b(zq, feat_cache=feat_cache, feat_idx=feat_idx)
         
         # Normalize and condition
         norm_f = self.norm_layer(f)
         new_f = norm_f * conv_y + conv_b
         
-        return new_f, None
+        return new_f, feat_idx, feat_cache
     
     def _call_with_conv_cache(
         self,
@@ -770,7 +762,7 @@ class FlaxCogVideoXResnetBlock3D(nnx.Module):
         zq: Optional[jnp.ndarray] = None,
         conv_cache: Optional[Dict[str, jnp.ndarray]] = None,
         feat_cache: Optional[list] = None,
-        feat_idx: Optional[list] = None,
+        feat_idx: int = 0,
         deterministic: bool = True,
     ):
         """
@@ -786,18 +778,21 @@ class FlaxCogVideoXResnetBlock3D(nnx.Module):
             zq: Spatial conditioning (for decoder)
             conv_cache: 旧模式的缓存字典
             feat_cache: 新模式的缓存列表
-            feat_idx: 新模式的索引列表
+            feat_idx: 新模式的索引
             deterministic: Whether to use dropout
             
         Returns:
-            Output tensor and updated cache (或 None)
+            Output tensor
+            feat_idx: 更新后的索引
+            feat_cache: 更新后的缓存
         """
         # 新模式：使用 feat_cache/feat_idx
-        if feat_cache is not None and feat_idx is not None:
+        if feat_cache is not None:
             return self._call_with_feat_cache(inputs, temb, zq, feat_cache, feat_idx, deterministic)
         
         # 旧模式：使用 conv_cache
-        return self._call_with_conv_cache(inputs, temb, zq, conv_cache, deterministic)
+        output, conv_cache = self._call_with_conv_cache(inputs, temb, zq, conv_cache, deterministic)
+        return output, feat_idx, feat_cache
     
     def _call_with_feat_cache(
         self,
@@ -805,7 +800,7 @@ class FlaxCogVideoXResnetBlock3D(nnx.Module):
         temb: Optional[jnp.ndarray],
         zq: Optional[jnp.ndarray],
         feat_cache: list,
-        feat_idx: list,
+        feat_idx: int,
         deterministic: bool,
     ):
         """新缓存模式的实现"""
@@ -813,12 +808,12 @@ class FlaxCogVideoXResnetBlock3D(nnx.Module):
         
         # First norm and conv
         if zq is not None:
-            hidden_states, _ = self.norm1(hidden_states, zq, feat_cache=feat_cache, feat_idx=feat_idx)
+            hidden_states, feat_idx, feat_cache = self.norm1(hidden_states, zq, feat_cache=feat_cache, feat_idx=feat_idx)
         else:
             hidden_states = self.norm1(hidden_states)
         
         hidden_states = jax.nn.silu(hidden_states)
-        hidden_states, _ = self.conv1(hidden_states, feat_cache=feat_cache, feat_idx=feat_idx)
+        hidden_states, feat_idx, feat_cache = self.conv1(hidden_states, feat_cache=feat_cache, feat_idx=feat_idx)
         
         # Time embedding
         if temb is not None and self.temb_proj is not None:
@@ -827,7 +822,7 @@ class FlaxCogVideoXResnetBlock3D(nnx.Module):
         
         # Second norm and conv
         if zq is not None:
-            hidden_states, _ = self.norm2(hidden_states, zq, feat_cache=feat_cache, feat_idx=feat_idx)
+            hidden_states, feat_idx, feat_cache = self.norm2(hidden_states, zq, feat_cache=feat_cache, feat_idx=feat_idx)
         else:
             hidden_states = self.norm2(hidden_states)
         
@@ -837,19 +832,19 @@ class FlaxCogVideoXResnetBlock3D(nnx.Module):
         if self.dropout_rate > 0 and not deterministic:
             hidden_states = nnx.Dropout(rate=self.dropout_rate)(hidden_states)
         
-        hidden_states, _ = self.conv2(hidden_states, feat_cache=feat_cache, feat_idx=feat_idx)
+        hidden_states, feat_idx, feat_cache = self.conv2(hidden_states, feat_cache=feat_cache, feat_idx=feat_idx)
         
         # Shortcut
         if self.conv_shortcut is not None:
             if self.use_conv_shortcut:
-                inputs, _ = self.conv_shortcut(inputs, feat_cache=feat_cache, feat_idx=feat_idx)
+                inputs, feat_idx, feat_cache = self.conv_shortcut(inputs, feat_cache=feat_cache, feat_idx=feat_idx)
             else:
                 inputs = self.conv_shortcut(inputs)
         
         # Residual connection
         hidden_states = hidden_states + inputs
         
-        return hidden_states, None
+        return hidden_states, feat_idx, feat_cache
     
     def _call_with_conv_cache(
         self,
@@ -979,10 +974,78 @@ class FlaxCogVideoXDownBlock3D(nnx.Module):
         temb: Optional[jnp.ndarray] = None,
         zq: Optional[jnp.ndarray] = None,
         conv_cache: Optional[Dict[str, jnp.ndarray]] = None,
+        feat_cache: Optional[list] = None,
+        feat_idx: int = 0,
         deterministic: bool = True,
     ):
         new_conv_cache = {}
         conv_cache = conv_cache or {}
+        
+        if feat_cache is not None:
+            for resnet in self.resnets:
+                hidden_states, feat_idx, feat_cache = resnet(
+                    hidden_states, temb, zq, 
+                    feat_cache=feat_cache, feat_idx=feat_idx, 
+                    deterministic=deterministic
+                )
+            
+            if self.downsamplers is not None:
+                # Handle time compression if needed
+                if self.compress_time:
+                    B, T, H, W, C = hidden_states.shape
+                    # Compress time dimension using avg pooling
+                    # Match PyTorch's implementation
+                    hidden_states = hidden_states.reshape(B * H * W, T, C)
+                    hidden_states = hidden_states.transpose(0, 2, 1)  # (B*H*W, C, T)
+                    
+                    if T % 2 == 1:
+                        # Handle odd frames: keep first, avg pool rest
+                        first_frame = hidden_states[:, :, 0:1]
+                        rest_frames = hidden_states[:, :, 1:]
+                        if rest_frames.shape[2] > 0:
+                            # Simple avg pooling
+                            rest_frames = jnp.mean(
+                                rest_frames.reshape(B*H*W, C, rest_frames.shape[2]//2, 2),
+                                axis=-1
+                            )
+                        hidden_states = jnp.concatenate([first_frame, rest_frames], axis=2)
+                    else:
+                        # Even frames: regular avg pooling
+                        hidden_states = jnp.mean(
+                            hidden_states.reshape(B*H*W, C, T//2, 2),
+                            axis=-1
+                        )
+                    
+                    # Reshape back
+                    T_new = hidden_states.shape[2]
+                    hidden_states = hidden_states.transpose(0, 2, 1)  # (B*H*W, T_new, C)
+                    hidden_states = hidden_states.reshape(B, H, W, T_new, C)
+                    hidden_states = hidden_states.transpose(0, 3, 1, 2, 4)  # (B, T_new, H, W, C)
+                
+                # Apply 2D spatial downsampling
+                for downsampler in self.downsamplers:
+                    B, T, H, W, C = hidden_states.shape
+                    
+                    # Add manual padding (0, 1, 0, 1) matching PyTorch's implementation
+                    # JAX padding format: ((before_1, after_1), (before_2, after_2), ...)
+                    pad_width = [
+                        (0, 0),  # batch
+                        (0, 0),  # time
+                        (0, 1),  # height: pad bottom
+                        (0, 1),  # width: pad right
+                        (0, 0),  # channels
+                    ]
+                    hidden_states = jnp.pad(hidden_states, pad_width, mode='constant', constant_values=0)
+                    
+                    # Reshape to apply 2D conv: (B, T, H, W, C) → (B*T, H, W, C)
+                    _, _, H_padded, W_padded, _ = hidden_states.shape
+                    hidden_states = hidden_states.reshape(B * T, H_padded, W_padded, C)
+                    hidden_states = downsampler(hidden_states)
+                    # Reshape back: (B*T, H', W', C) → (B, T, H', W', C)
+                    _, H_new, W_new, _ = hidden_states.shape
+                    hidden_states = hidden_states.reshape(B, T, H_new, W_new, C)
+            
+            return hidden_states, feat_idx, feat_cache
         
         for i, resnet in enumerate(self.resnets):
             conv_cache_key = f"resnet_{i}"
@@ -1089,7 +1152,7 @@ class FlaxCogVideoXMidBlock3D(nnx.Module):
         zq: Optional[jnp.ndarray] = None,
         conv_cache: Optional[Dict[str, jnp.ndarray]] = None,
         feat_cache: Optional[list] = None,
-        feat_idx: Optional[list] = None,
+        feat_idx: int = 0,
         deterministic: bool = True,
     ):
         """
@@ -1100,14 +1163,14 @@ class FlaxCogVideoXMidBlock3D(nnx.Module):
         2. feat_cache/feat_idx: 新模式（逐帧解码）
         """
         # 新模式：使用 feat_cache/feat_idx
-        if feat_cache is not None and feat_idx is not None:
+        if feat_cache is not None:
             for resnet in self.resnets:
-                hidden_states, _ = resnet(
+                hidden_states, feat_idx, feat_cache = resnet(
                     hidden_states, temb, zq,
                     feat_cache=feat_cache, feat_idx=feat_idx,
                     deterministic=deterministic
                 )
-            return hidden_states, None
+            return hidden_states, feat_idx, feat_cache
         
         # 旧模式：使用 conv_cache
         new_conv_cache = {}
@@ -1186,13 +1249,13 @@ class FlaxCogVideoXUpBlock3D(nnx.Module):
         zq: Optional[jnp.ndarray] = None,
         conv_cache: Optional[Dict[str, jnp.ndarray]] = None,
         feat_cache: Optional[list] = None,
-        feat_idx: Optional[list] = None,
+        feat_idx: int = 0,
         deterministic: bool = True,
     ):
         # 新模式：使用 feat_cache/feat_idx（逐帧解码）
-        if feat_cache is not None and feat_idx is not None:
+        if feat_cache is not None:
             for resnet in self.resnets:
-                hidden_states, _ = resnet(
+                hidden_states, feat_idx, feat_cache = resnet(
                     hidden_states, temb, zq,
                     feat_cache=feat_cache, feat_idx=feat_idx,
                     deterministic=deterministic
@@ -1229,7 +1292,7 @@ class FlaxCogVideoXUpBlock3D(nnx.Module):
                     _, H_final, W_final, _ = hidden_states.shape
                     hidden_states = hidden_states.reshape(B, T_new, H_final, W_final, C)
             
-            return hidden_states, None
+            return hidden_states, feat_idx, feat_cache
         
         # 旧模式：使用 conv_cache
         new_conv_cache = {}
@@ -1419,10 +1482,40 @@ class FlaxCogVideoXEncoder3D(nnx.Module):
         sample: jnp.ndarray,
         temb: Optional[jnp.ndarray] = None,
         conv_cache: Optional[Dict[str, jnp.ndarray]] = None,
+        feat_cache: Optional[list] = None,
+        feat_idx: int = 0,
         deterministic: bool = True,
     ):
         new_conv_cache = {}
         conv_cache = conv_cache or {}
+        
+        if feat_cache is not None:
+            # Input conv
+            hidden_states, feat_idx, feat_cache = self.conv_in(sample, feat_cache=feat_cache, feat_idx=feat_idx)
+            
+            # Down blocks
+            for i, down_block in enumerate(self.down_blocks):
+                hidden_states, feat_idx, feat_cache = down_block(
+                    hidden_states, temb, None, 
+                    feat_cache=feat_cache, feat_idx=feat_idx, 
+                    deterministic=deterministic
+                )
+            
+            # Mid block
+            hidden_states, feat_idx, feat_cache = self.mid_block(
+                hidden_states, temb, None, 
+                feat_cache=feat_cache, feat_idx=feat_idx, 
+                deterministic=deterministic
+            )
+            
+            # Output
+            hidden_states = self.norm_out(hidden_states)
+            hidden_states = jax.nn.silu(hidden_states)
+            hidden_states, feat_idx, feat_cache = self.conv_out(
+                hidden_states, feat_cache=feat_cache, feat_idx=feat_idx
+            )
+            
+            return hidden_states, feat_cache
         
         # Input conv
         hidden_states, new_conv_cache["conv_in"] = self.conv_in(
@@ -1556,7 +1649,7 @@ class FlaxCogVideoXDecoder3D(nnx.Module):
         temb: Optional[jnp.ndarray] = None,
         conv_cache: Optional[Dict[str, jnp.ndarray]] = None,
         feat_cache: Optional[list] = None,
-        feat_idx: Optional[list] = None,
+        feat_idx: int = 0,
         deterministic: bool = True,
     ):
         """
@@ -1572,16 +1665,16 @@ class FlaxCogVideoXDecoder3D(nnx.Module):
             temb: Time embedding (optional)
             conv_cache: 旧模式的缓存字典
             feat_cache: 新模式的缓存列表
-            feat_idx: 新模式的索引列表
+            feat_idx: 新模式的索引
             deterministic: Whether to use dropout
         """
         # 新模式：使用 feat_cache/feat_idx
-        if feat_cache is not None and feat_idx is not None:
+        if feat_cache is not None:
             # Input conv
-            hidden_states, _ = self.conv_in(sample, feat_cache=feat_cache, feat_idx=feat_idx)
+            hidden_states, feat_idx, feat_cache = self.conv_in(sample, feat_cache=feat_cache, feat_idx=feat_idx)
             
             # Mid block
-            hidden_states, _ = self.mid_block(
+            hidden_states, feat_idx, feat_cache = self.mid_block(
                 hidden_states, temb, sample,
                 feat_cache=feat_cache, feat_idx=feat_idx,
                 deterministic=deterministic
@@ -1589,18 +1682,18 @@ class FlaxCogVideoXDecoder3D(nnx.Module):
             
             # Up blocks
             for i, up_block in enumerate(self.up_blocks):
-                hidden_states, _ = up_block(
+                hidden_states, feat_idx, feat_cache = up_block(
                     hidden_states, temb, sample,
                     feat_cache=feat_cache, feat_idx=feat_idx,
                     deterministic=deterministic
                 )
             
             # Output
-            hidden_states, _ = self.norm_out(hidden_states, sample, feat_cache=feat_cache, feat_idx=feat_idx)
+            hidden_states, feat_idx, feat_cache = self.norm_out(hidden_states, sample, feat_cache=feat_cache, feat_idx=feat_idx)
             hidden_states = jax.nn.silu(hidden_states)
-            hidden_states, _ = self.conv_out(hidden_states, feat_cache=feat_cache, feat_idx=feat_idx)
+            hidden_states, feat_idx, feat_cache = self.conv_out(hidden_states, feat_cache=feat_cache, feat_idx=feat_idx)
             
-            return hidden_states, None
+            return hidden_states, feat_cache
         
         # 旧模式：使用 conv_cache
         new_conv_cache = {}
@@ -1636,51 +1729,6 @@ class FlaxCogVideoXDecoder3D(nnx.Module):
 
 
 # Continued in next part...
-
-class FlaxCogVideoXCache:
-    """
-    缓存管理类，用于逐帧解码时存储 CausalConv3d 层的中间结果。
-    
-    基于 AutoencoderKLWanCache 的设计，但针对 CogVideoX 的结构优化。
-    这个缓存允许我们逐帧处理 decoder，避免一次性加载所有帧导致 OOM。
-    """
-    
-    def __init__(self, decoder_module):
-        """
-        初始化缓存。
-        
-        Args:
-            decoder_module: FlaxCogVideoXDecoder3D 实例
-        """
-        self.decoder_module = decoder_module
-        self.clear_cache()
-    
-    def clear_cache(self):
-        """重置所有缓存和索引"""
-        # 计算 decoder 中有多少个 CausalConv3d 层
-        self._conv_num = self._count_causal_conv3d(self.decoder_module)
-        self._conv_idx = [0]  # 使用列表以便在函数间传递引用
-        self._feat_map = [None] * self._conv_num
-    
-    @staticmethod
-    def _count_causal_conv3d(module):
-        """
-        递归计算模块中 FlaxCogVideoXCausalConv3d 层的数量。
-        
-        Args:
-            module: nnx.Module 实例
-            
-        Returns:
-            int: CausalConv3d 层的数量
-        """
-        count = 0
-        # 使用 nnx.graph.iter_graph 遍历所有子模块
-        node_types = nnx.graph.iter_graph([module])
-        for _, value in node_types:
-            if isinstance(value, FlaxCogVideoXCausalConv3d):
-                count += 1
-        return count
-
 
 class FlaxAutoencoderKLCogVideoX(nnx.Module):
     """
@@ -1775,8 +1823,39 @@ class FlaxAutoencoderKLCogVideoX(nnx.Module):
         # Frame batch sizes for processing
         # decode 时必须逐帧处理（batch=1）以避免 OOM
         # batch=2 会导致 40GB 内存需求，超过 TPU v6e 的 32GB 限制
-        self.num_latent_frames_batch_size = 1  # decode 时每批 1 帧
+        # Update: 配合 feat_cache 优化，可以尝试 batch=2
+        self.num_latent_frames_batch_size = 2  # decode 时每批 2 帧
         self.num_sample_frames_batch_size = 8  # encode 时每批 8 帧
+        
+        # Precompute and cache conv counts for encoder and decoder for clear_cache speedup
+        self._cached_conv_counts = {
+            "decoder": self._count_causal_conv3d(self.decoder) if self.decoder is not None else 0,
+            "encoder": self._count_causal_conv3d(self.encoder) if self.encoder is not None else 0,
+        }
+
+    def _count_causal_conv3d(self, module):
+        """Count the number of CausalConv3d layers in a module."""
+        count = 0
+        # Use nnx.graph.iter_graph to traverse all submodules
+        node_types = nnx.graph.iter_graph([module])
+        for _, value in node_types:
+            if isinstance(value, FlaxCogVideoXCausalConv3d):
+                count += 1
+        return count
+
+    def clear_cache(self):
+        """Initialize feat_cache for decoder and encoder.
+        
+        In Flax/NNX, we don't store the cache as an attribute to avoid static/dynamic type issues.
+        Instead, we return initialized caches that should be passed as local variables.
+        This method is kept for API compatibility but doesn't modify self.
+        """
+        pass
+
+    def _init_feat_cache(self, mode="decoder"):
+        """Initialize feature cache list."""
+        count = self._cached_conv_counts.get(mode, 0)
+        return [None] * count
     
     def enable_tiling(
         self,
@@ -1846,9 +1925,11 @@ class FlaxAutoencoderKLCogVideoX(nnx.Module):
             return self.tiled_encode(x, deterministic=deterministic)
         
         # Frame batching
+        enc_feat_map = self._init_feat_cache("encoder")
+        
         frame_batch_size = self.num_sample_frames_batch_size
         num_batches = max(num_frames // frame_batch_size, 1)
-        conv_cache = None
+        # conv_cache = None  # Removed in favor of enc_feat_map
         enc = []
         
         for i in range(num_batches):
@@ -1857,8 +1938,8 @@ class FlaxAutoencoderKLCogVideoX(nnx.Module):
             end_frame = frame_batch_size * (i + 1) + remaining_frames
             x_intermediate = x[:, start_frame:end_frame, :, :, :]
             
-            x_intermediate, conv_cache = self.encoder(
-                x_intermediate, conv_cache=conv_cache, deterministic=deterministic
+            x_intermediate, enc_feat_map = self.encoder(
+                x_intermediate, feat_cache=enc_feat_map, deterministic=deterministic
             )
             
             if self.quant_conv is not None:
@@ -1892,7 +1973,7 @@ class FlaxAutoencoderKLCogVideoX(nnx.Module):
         """
         Internal decode with frame-by-frame processing using feat_cache.
         
-        这是参考 WAN VAE 的逐帧解码实现，通过 FlaxCogVideoXCache 管理所有 CausalConv3d 层的缓存。
+        这是参考 WAN VAE 的逐帧解码实现，使用实例属性 _feat_map 管理缓存。
         每个 latent 帧独立处理并上采样到 temporal_compression_ratio 倍的视频帧。
         
         Args:
@@ -1939,44 +2020,42 @@ class FlaxAutoencoderKLCogVideoX(nnx.Module):
         if self.use_tiling and (width > self.tile_latent_min_width or height > self.tile_latent_min_height):
             return self.tiled_decode(z, zq, deterministic=deterministic)
         
-        # 创建缓存管理器（参考 WAN 的 _decode 实现）
-        # 重要：每次调用都创建全新的缓存，避免内存泄漏
-        feat_cache_manager = FlaxCogVideoXCache(self.decoder)
-        log_memory("创建缓存管理器后")
+        # 使用实例属性初始化缓存
+        # self.clear_cache()  # Removed: we use local variable for cache
+        feat_map = self._init_feat_cache("decoder")
+        log_memory("初始化缓存后")
         
         # 应用 post_quant_conv 到整个 latent（如果存在）
         if self.post_quant_conv is not None:
             z = self.post_quant_conv(z)
             log_memory("post_quant_conv 后")
         
-        # 逐帧解码（缓存共享，每帧只重置索引）
+        # 逐帧解码（或按批次解码）
         decoded_frames_list = []
+        frame_batch_size = self.num_latent_frames_batch_size
+        num_batches = max(num_frames // frame_batch_size, 1)
         
         try:
-            for i in range(num_frames):
-                # 每帧重置索引（不清空缓存，保持帧间连续性）
-                feat_cache_manager._conv_idx = [0]
+            for i in range(num_batches):
+                remaining_frames = num_frames % frame_batch_size
+                start_frame = frame_batch_size * i + (0 if i == 0 else remaining_frames)
+                end_frame = frame_batch_size * (i + 1) + remaining_frames
                 
-                # 提取当前 latent 帧
-                z_frame = z[:, i:i+1, :, :, :]
-                zq_frame = zq[:, i:i+1, :, :, :]
+                # 提取当前批次 latent 帧
+                z_frame = z[:, start_frame:end_frame, :, :, :]
+                zq_frame = zq[:, start_frame:end_frame, :, :, :]
                 
-                # 使用共享缓存解码当前帧
-                # 每个 latent 帧会被上采样到 temporal_compression_ratio 倍的视频帧 (通常是 4 帧)
-                decoded_frame, _ = self.decoder(
+                # 使用实例属性缓存解码
+                decoded_frame, feat_map = self.decoder(
                     z_frame, zq_frame,
-                    feat_cache=feat_cache_manager._feat_map,
-                    feat_idx=feat_cache_manager._conv_idx,
+                    feat_cache=feat_map,
                     deterministic=deterministic
                 )
                 
-                # 直接添加解码结果
-                # CogVideoX 使用 jax.image.resize 进行时序上采样，不需要帧顺序修正
                 decoded_frames_list.append(decoded_frame)
                 
-                # 每 8 帧打印一次内存状态
-                if enable_memory_debug and ((i + 1) % 8 == 0 or i == 0):
-                    log_memory(f"解码第 {i+1}/{num_frames} 帧后")
+                if enable_memory_debug:
+                    log_memory(f"解码批次 {i+1}/{num_batches} 后")
             
             log_memory("所有帧解码完成，准备拼接")
             
@@ -1990,15 +2069,7 @@ class FlaxAutoencoderKLCogVideoX(nnx.Module):
             return decoded
         finally:
             log_memory("开始清理缓存")
-            
-            # 显式清理所有缓存和中间变量
-            for i in range(len(feat_cache_manager._feat_map)):
-                feat_cache_manager._feat_map[i] = None
-            feat_cache_manager._feat_map = None
-            feat_cache_manager._conv_idx = None
-            del feat_cache_manager
-            decoded_frames_list = None
-            
+            # self.clear_cache() # Removed
             log_memory("清理缓存完成")
             if enable_memory_debug:
                 print(f"[内存] 解码结束\n")
@@ -2048,7 +2119,7 @@ class FlaxAutoencoderKLCogVideoX(nnx.Module):
             row = []
             for j in range(0, width, overlap_width):
                 num_batches = max(num_frames // frame_batch_size, 1)
-                conv_cache = None
+                enc_feat_map = self._init_feat_cache("encoder")
                 time = []
                 
                 for k in range(num_batches):
@@ -2064,7 +2135,9 @@ class FlaxAutoencoderKLCogVideoX(nnx.Module):
                         :
                     ]
                     
-                    tile, conv_cache = self.encoder(tile, conv_cache=conv_cache, deterministic=deterministic)
+                    tile, enc_feat_map = self.encoder(
+                        tile, feat_cache=enc_feat_map, deterministic=deterministic
+                    )
                     
                     if self.quant_conv is not None:
                         tile = self.quant_conv(tile)
@@ -2117,7 +2190,7 @@ class FlaxAutoencoderKLCogVideoX(nnx.Module):
             row = []
             for j in range(0, width, overlap_width):
                 num_batches = max(num_frames // frame_batch_size, 1)
-                conv_cache = None
+                feat_map = self._init_feat_cache("decoder")
                 time = []
                 
                 for k in range(num_batches):
@@ -2144,7 +2217,9 @@ class FlaxAutoencoderKLCogVideoX(nnx.Module):
                     if self.post_quant_conv is not None:
                         tile = self.post_quant_conv(tile)
                     
-                    tile, conv_cache = self.decoder(tile, tile_zq, conv_cache=conv_cache, deterministic=deterministic)
+                    tile, feat_map = self.decoder(
+                        tile, tile_zq, feat_cache=feat_map, deterministic=deterministic
+                    )
                     time.append(tile)
                 
                 row.append(jnp.concatenate(time, axis=1))
