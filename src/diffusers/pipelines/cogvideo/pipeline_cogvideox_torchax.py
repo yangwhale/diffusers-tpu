@@ -31,7 +31,8 @@ from transformers import T5EncoderModel, T5Tokenizer
 
 from ...callbacks import MultiPipelineCallbacks, PipelineCallback
 from ...loaders import CogVideoXLoraLoaderMixin
-from ...models import AutoencoderKLCogVideoX, CogVideoXTransformer3DModel
+from ...models.autoencoders.autoencoder_kl_cogvideox_torchax import AutoencoderKLCogVideoX
+from ...models.transformers.cogvideox_transformer_3d_torchax import CogVideoXTransformer3DModel
 from ...models.embeddings import get_3d_rotary_pos_embed
 from ...pipelines.pipeline_utils import DiffusionPipeline
 from ...schedulers import CogVideoXDDIMScheduler, CogVideoXDPMScheduler
@@ -967,20 +968,15 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
             # Discard any padding frames that were added for CogVideoX 1.5
             latents = latents[:, additional_frames:]
 
-            # Convert torchax.Tensor to JAX array for VAE decode
-            if hasattr(latents, '_elem'):
-                latents_jax = latents._elem
-            else:
-                latents_jax = env.t2j_iso(latents)
+            # CogVideoX latent format: [B, T, C, H, W] -> [B, C, T, H, W] for VAE
+            # The torchax VAE expects [B, C, T, H, W] format
+            latents = latents.permute(0, 2, 1, 3, 4)
 
-            # CogVideoX latent format: [B, T, C, H, W] -> [B, C, T, H, W]
-            latents_jax = jnp.transpose(latents_jax, (0, 2, 1, 3, 4))
+            # Apply scaling factor (VAE expects unscaled latents, we scale here)
+            latents = 1 / self.vae_scaling_factor_image * latents
 
-            # Apply scaling factor
-            latents_jax = latents_jax.astype(jnp.bfloat16)
-            latents_jax = 1 / self.vae_scaling_factor_image * latents_jax
-
-            video = self.vae.decode(latents_jax, return_dict=False)[0]
+            # Decode using torchax VAE (accepts torch.Tensor / torchax.Tensor)
+            video = self.vae.decode(latents, return_dict=False)[0]
             video = self.video_processor.postprocess_video(video=video, output_type=output_type)
         else:
             video = latents
