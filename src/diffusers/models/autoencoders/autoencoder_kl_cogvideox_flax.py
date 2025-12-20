@@ -28,9 +28,58 @@ from typing import Dict, Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp
+from jax.sharding import PartitionSpec as P
 from flax import nnx
 
 from ...configuration_utils import ConfigMixin
+
+
+def _apply_sharding_constraint(inputs, is_nthwc=True):
+    """
+    Apply sharding constraint to distribute data across TPUs.
+    
+    This function mirrors the TorchAx mark_sharding behavior in autoencoder_kl_cogvideox_torchax.py:143-160.
+    It tries multiple PartitionSpec configurations with fallback to handle different mesh setups.
+    
+    Args:
+        inputs: JAX array to apply sharding to
+        is_nthwc: If True, use NTHWC format (Flax), otherwise NCTHW (TorchAx)
+        
+    Returns:
+        inputs with sharding constraint applied (or unchanged if not in mesh context)
+    """
+    # PartitionSpec for Flax NTHWC format:
+    # - Batch (N): None (not sharded)
+    # - Time (T): None (not sharded)
+    # - Height (H): None (not sharded)
+    # - Width (W): ("dp", "tp") or ("tp") or ("dp") - sharded across devices
+    # - Channels (C): None (not sharded)
+    
+    # TorchAx NCTHW would have W at index 4, but Flax NTHWC has W at index 3
+    if is_nthwc:
+        # Flax format: (B, T, H, W, C) - shard on W (index 3)
+        specs = [
+            P(None, None, None, ("dp", "tp"), None),  # Try dp+tp first
+            P(None, None, None, ("tp",), None),       # Try tp only
+            P(None, None, None, ("dp",), None),       # Try dp only
+        ]
+    else:
+        # TorchAx format: (B, C, T, H, W) - shard on W (index 4)
+        specs = [
+            P(None, None, None, None, ("dp", "tp")),
+            P(None, None, None, None, ("tp",)),
+            P(None, None, None, None, ("dp",)),
+        ]
+    
+    for spec in specs:
+        try:
+            return jax.lax.with_sharding_constraint(inputs, spec)
+        except (ValueError, Exception):
+            # This spec didn't work, try next one
+            continue
+    
+    # No sharding worked (likely not in a mesh context), return unchanged
+    return inputs
 
 
 @dataclass
@@ -288,6 +337,12 @@ class FlaxCogVideoXCausalConv3d(nnx.Module):
                 (0, 0),  # channels
             ]
             inputs = jnp.pad(inputs, pad_width, mode='edge')
+            
+            # ⚠️ 添加分片约束（与 TorchAx 对齐）
+            # Flax NTHWC: 在 Width 维度分片 (index 3)
+            # TorchAx NCTHW: 在 Width 维度分片 (index 4)
+            inputs = _apply_sharding_constraint(inputs, is_nthwc=True)
+            
             output = self.conv(inputs)
             return output, feat_idx, feat_cache
         else:
@@ -330,6 +385,10 @@ class FlaxCogVideoXCausalConv3d(nnx.Module):
                 # TorchAx: feat_cache[idx] = cache_x
                 feat_cache[idx] = cache_x
                 feat_idx += 1
+            
+            # ⚠️ 添加分片约束（与 TorchAx 对齐）
+            # Flax NTHWC: 在 Width 维度分片 (index 3)
+            inputs = _apply_sharding_constraint(inputs, is_nthwc=True)
             
             # 执行卷积
             output = self.conv(inputs)
