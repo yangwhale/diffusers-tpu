@@ -581,33 +581,47 @@ class FlaxWanResample(nnx.Module):
         # Handle time_conv for 3D modes
         if self.mode == "upsample3d":
             if feat_cache is not None:
-                CACHE_T = 2
-                cache_x = x[:, -CACHE_T:, :, :, :]
-                
                 prev_cache = feat_cache[feat_idx]
                 
-                # Check if we need to pad with previous chunk's last frame
-                if cache_x.shape[1] < 2 and prev_cache is not None:
-                    last_frame = prev_cache[:, -1:, :, :, :]
-                    cache_x = jnp.concatenate([last_frame, cache_x], axis=1)
-                
-                if cache_x.shape[1] < 2 and prev_cache is None:
-                    zeros = jnp.zeros_like(cache_x)
-                    cache_x = jnp.concatenate([zeros, cache_x], axis=1)
-                    
+                # CRITICAL FIX: Match TorchAx behavior
+                # First time (prev_cache is None): only set cache marker, NO time upsampling
+                # Subsequent times: do time upsampling
                 if prev_cache is None:
-                    # First time: no cache to use
-                    x = self.time_conv(x, feat_cache=None)
+                    # First time: just set cache marker, don't do time upsampling
+                    # This matches TorchAx: feat_cache[idx] = (None,)
+                    feat_cache[feat_idx] = (None,)  # Use tuple to match TorchAx format
+                    feat_idx += 1
+                    # Skip time_conv and reshape - go directly to spatial resampling
                 else:
-                    temp_cache = [prev_cache]
-                    x = self.time_conv(x, feat_cache=temp_cache, feat_idx=0)
-                
-                feat_cache[feat_idx] = cache_x
-                feat_idx += 1
-                
-                # Reshape: (B, T, H, W, 2*C) -> (B, T*2, H, W, C)
-                x = x.reshape(B, T, H, W, 2, self.dim)
-                x = x.transpose(0, 1, 4, 2, 3, 5).reshape(B, T * 2, H, W, self.dim)
+                    # Subsequent times: do time upsampling
+                    CACHE_T = 2
+                    cache_x = x[:, -CACHE_T:, :, :, :]
+                    
+                    # Check if we need to pad with previous chunk's last frame
+                    # prev_cache is a tuple: (cache_tensor,) or (None,)
+                    prev_cache_tensor = prev_cache[0] if isinstance(prev_cache, tuple) else prev_cache
+                    
+                    if cache_x.shape[1] < 2 and prev_cache_tensor is not None:
+                        last_frame = prev_cache_tensor[:, -1:, :, :, :]
+                        cache_x = jnp.concatenate([last_frame, cache_x], axis=1)
+                    
+                    if cache_x.shape[1] < 2 and prev_cache_tensor is None:
+                        zeros = jnp.zeros_like(cache_x)
+                        cache_x = jnp.concatenate([zeros, cache_x], axis=1)
+                        
+                    if prev_cache_tensor is None:
+                        # Cache was (None,), so no actual cache to use for time_conv
+                        x = self.time_conv(x, feat_cache=None)
+                    else:
+                        temp_cache = [prev_cache_tensor]
+                        x = self.time_conv(x, feat_cache=temp_cache, feat_idx=0)
+                    
+                    feat_cache[feat_idx] = (cache_x,)  # Use tuple to match TorchAx
+                    feat_idx += 1
+                    
+                    # Reshape: (B, T, H, W, 2*C) -> (B, T*2, H, W, C)
+                    x = x.reshape(B, T, H, W, 2, self.dim)
+                    x = x.transpose(0, 1, 4, 2, 3, 5).reshape(B, T * 2, H, W, self.dim)
         
         # Prepare for 2D spatial resampling
         # x: (B, T, H, W, C)
