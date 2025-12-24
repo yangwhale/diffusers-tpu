@@ -14,11 +14,27 @@
 # limitations under the License.
 
 """
-CogVideoX VAE with Wan-style feat_cache for TPU compatibility.
-This version uses list-based feat_cache instead of dict-based conv_cache
-to be more TPU-friendly and avoid OOM during compilation.
+TorchAx/TPU 版本的 CogVideoX VAE。
+
+本文件是从 autoencoder_kl_cogvideox.py 改造而来，用于在 TPU 上高效运行。
+主要改动点（用 # TORCHAX: 标记）：
+
+1. 导入部分：添加 JAX/TorchAx 相关导入
+2. GroupNorm：使用 JAX 的 Welford 算法实现内存优化的 GroupNorm
+3. CogVideoXSafeConv3d：移除 GPU 专用的分块逻辑（TPU 不需要）
+4. 缓存机制：将 dict-based conv_cache 改为 list-based feat_cache（TPU 友好）
+5. forward 签名：(conv_cache: Dict) -> (feat_cache: List, feat_idx: int)
+6. Sharding：添加 TPU 分片约束
+7. 移除 gradient_checkpointing 相关逻辑（TPU 不需要）
+
+改造原则：
+- 保持与原始版本相同的模型结构和权重兼容性
+- 最小化代码改动，便于对比和维护
+- 所有改动用 # TORCHAX: 注释标记
 """
 
+# ==================== 导入部分 ====================
+# TORCHAX: 移除 Dict 类型导入（不再使用 dict-based cache）
 from typing import Optional, Tuple, Union
 
 import numpy as np
@@ -37,111 +53,65 @@ from ..modeling_utils import ModelMixin
 from ..upsampling import CogVideoXUpsample3D
 from .vae import AutoencoderMixin, DecoderOutput, DiagonalGaussianDistribution
 
+# TORCHAX: 添加 JAX/TorchAx 相关导入
 import jax
 import jax.numpy as jnp
 from torchax import interop
 
+# TORCHAX: TPU sharding 支持
 from jax.sharding import PartitionSpec as P
 mark_sharding = interop.torch_view(jax.lax.with_sharding_constraint)
 
 
+logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+
+# ==================== TORCHAX: 内存优化的 GroupNorm ====================
+# 原始版本使用 nn.GroupNorm，但在 TPU 上会导致内存问题。
+# 这里使用 JAX 的 Welford 算法实现流式方差计算，节省约 50% 内存。
+
 def _jax_group_norm_5d(x, num_groups, weight, bias, eps):
-    """
-    Memory-optimized Group Normalization using JAX.
-    
-    This uses jnp.var() which internally uses Welford's online algorithm
-    for streaming variance computation, avoiding storing the full x² array.
-    This saves ~50% memory compared to standard nn.GroupNorm.
-    
-    Args:
-        x: Input tensor (B, C, T, H, W) - NCTHW format
-        num_groups: Number of groups
-        weight: Scale parameter (C,)
-        bias: Bias parameter (C,)
-        eps: Epsilon for numerical stability
-    
-    Returns:
-        Normalized tensor (B, C, T, H, W)
-    """
+    """JAX 实现的 5D GroupNorm，使用 Welford 算法节省内存。"""
     B, C, T, H, W = x.shape
     channels_per_group = C // num_groups
-    
-    # Reshape to expose groups: (B, num_groups, channels_per_group, T, H, W)
     x_grouped = x.reshape(B, num_groups, channels_per_group, T, H, W)
-    
-    # Key optimization: use jnp.mean/var instead of lax.square()
-    # jnp.var() internally uses Welford's algorithm for streaming computation
+    # jnp.var() 内部使用 Welford 算法，避免存储完整的 x² 数组
     mean = jnp.mean(x_grouped, axis=(2, 3, 4, 5), keepdims=True)
     var = jnp.var(x_grouped, axis=(2, 3, 4, 5), keepdims=True)
-    
-    # Normalize
     x_norm = (x_grouped - mean) / jnp.sqrt(var + eps)
-    
-    # Reshape back: (B, C, T, H, W)
     x_norm = x_norm.reshape(B, C, T, H, W)
-    
-    # Apply affine transformation
     if weight is not None:
         x_norm = x_norm * weight.reshape(1, C, 1, 1, 1)
     if bias is not None:
         x_norm = x_norm + bias.reshape(1, C, 1, 1, 1)
-    
     return x_norm
 
 
 def _jax_group_norm_4d(x, num_groups, weight, bias, eps):
-    """
-    Memory-optimized Group Normalization using JAX for 4D tensors.
-    
-    Args:
-        x: Input tensor (B, C, H, W) - NCHW format
-        num_groups: Number of groups
-        weight: Scale parameter (C,)
-        bias: Bias parameter (C,)
-        eps: Epsilon for numerical stability
-    
-    Returns:
-        Normalized tensor (B, C, H, W)
-    """
+    """JAX 实现的 4D GroupNorm，使用 Welford 算法节省内存。"""
     B, C, H, W = x.shape
     channels_per_group = C // num_groups
-    
-    # Reshape to expose groups: (B, num_groups, channels_per_group, H, W)
     x_grouped = x.reshape(B, num_groups, channels_per_group, H, W)
-    
-    # Key optimization: use jnp.mean/var instead of lax.square()
     mean = jnp.mean(x_grouped, axis=(2, 3, 4), keepdims=True)
     var = jnp.var(x_grouped, axis=(2, 3, 4), keepdims=True)
-    
-    # Normalize
     x_norm = (x_grouped - mean) / jnp.sqrt(var + eps)
-    
-    # Reshape back: (B, C, H, W)
     x_norm = x_norm.reshape(B, C, H, W)
-    
-    # Apply affine transformation
     if weight is not None:
         x_norm = x_norm * weight.reshape(1, C, 1, 1)
     if bias is not None:
         x_norm = x_norm + bias.reshape(1, C, 1, 1)
-    
     return x_norm
 
 
-# Wrap JAX functions for TorchAx
 _torch_group_norm_5d = interop.torch_view(_jax_group_norm_5d)
 _torch_group_norm_4d = interop.torch_view(_jax_group_norm_4d)
 
 
 class CogVideoXOptimizedGroupNorm(nn.Module):
     """
-    Memory-optimized Group Normalization for TPU.
-    
-    Uses JAX's jnp.var() which internally uses Welford's online algorithm
-    for streaming variance computation, avoiding storing the full x² array.
-    This saves ~50% memory compared to standard nn.GroupNorm.
-    
-    This is the TorchAx equivalent of FlaxGroupNorm in autoencoder_kl_cogvideox_flax.py.
+    TORCHAX: 内存优化的 GroupNorm，替代 nn.GroupNorm。
+    使用 JAX 的 Welford 算法，节省约 50% 内存。
+    接口与 nn.GroupNorm 兼容，可直接替换。
     """
     
     def __init__(self, num_groups: int, num_channels: int, eps: float = 1e-6, affine: bool = True):
@@ -150,7 +120,6 @@ class CogVideoXOptimizedGroupNorm(nn.Module):
         self.num_channels = num_channels
         self.eps = eps
         self.affine = affine
-        
         if affine:
             self.weight = nn.Parameter(torch.ones(num_channels))
             self.bias = nn.Parameter(torch.zeros(num_channels))
@@ -160,40 +129,54 @@ class CogVideoXOptimizedGroupNorm(nn.Module):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim == 5:
-            # 5D: (B, C, T, H, W)
             return _torch_group_norm_5d(x, self.num_groups, self.weight, self.bias, self.eps)
         elif x.ndim == 4:
-            # 4D: (B, C, H, W)
             return _torch_group_norm_4d(x, self.num_groups, self.weight, self.bias, self.eps)
         else:
             raise ValueError(f"Expected 4D or 5D input, got {x.ndim}D")
 
 
-logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
-
+# TORCHAX: 缓存帧数常量，用于 feat_cache
 CACHE_T = 2
 
 
+# ==================== CogVideoXSafeConv3d ====================
+# 原始版本在 GPU 上会根据内存大小分块处理（2GB 限制）。
+# TORCHAX: 移除分块逻辑，TPU/XLA 编译器会自动优化内存管理。
+
 class CogVideoXSafeConv3d(nn.Conv3d):
     r"""
-    A 3D convolution layer for CogVideoX Model.
+    A 3D convolution layer that splits the input tensor to avoid OOM in CogVideoX Model.
     
-    OPTIMIZED for TPU: Removed GPU-specific chunk splitting logic.
-    The chunking was designed for CuDNN memory limits (2GB) but on TPU,
-    XLA compiler handles memory management more efficiently without manual chunking.
-    Manual chunking actually hurts TPU performance by interfering with XLA optimization.
+    TORCHAX: 移除了 GPU 专用的分块逻辑。
+    原因：分块是为 CuDNN 的 2GB 内存限制设计的，但 TPU 上：
+    1. XLA 编译器会自动进行内存优化
+    2. 手动分块会干扰 XLA 的优化策略
+    3. TPU HBM 内存管理方式与 GPU 不同
     """
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        # OPTIMIZED: Direct forward pass without chunking
-        # TPU/XLA handles large tensors more efficiently than GPU/CuDNN
+        # TORCHAX: 直接调用父类 forward，不分块
+        # 原始版本会在 memory_count > 2GB 时分块处理
         return super().forward(input)
 
 
+# ==================== CogVideoXCausalConv3d ====================
+# 这是最关键的改动：缓存机制从 dict-based 改为 list-based。
+#
+# 原始版本签名：
+#   forward(inputs, conv_cache: Optional[Dict[str, Tensor]] = None) -> Tuple[Tensor, Dict]
+#
+# TORCHAX 版本签名：
+#   forward(inputs, feat_cache: Optional[List] = None, feat_idx: int = 0) -> Tuple[Tensor, int, List]
+#
+# 改动原因：
+# 1. Dict 在 JAX/XLA 编译时会导致 trace 问题
+# 2. List + index 模式更适合 XLA 的静态图编译
+# 3. 参考 Wan2.1 的 feat_cache 设计
+
 class CogVideoXCausalConv3d(nn.Module):
     r"""A 3D causal convolution layer that pads the input tensor to ensure causality in CogVideoX Model.
-    
-    This version uses Wan-style feat_cache for TPU compatibility.
 
     Args:
         in_channels (`int`): Number of channels in the input tensor.
@@ -220,6 +203,8 @@ class CogVideoXCausalConv3d(nn.Module):
 
         time_kernel_size, height_kernel_size, width_kernel_size = kernel_size
 
+        # TODO(aryan): configure calculation based on stride and dilation in the future.
+        # Since CogVideoX does not use it, it is currently tailored to "just work" with Mochi
         time_pad = time_kernel_size - 1
         height_pad = (height_kernel_size - 1) // 2
         width_pad = (width_kernel_size - 1) // 2
@@ -246,83 +231,78 @@ class CogVideoXCausalConv3d(nn.Module):
             padding_mode="zeros",
         )
 
-    def forward(self, inputs: torch.Tensor, feat_cache=None, feat_idx=0):
+    # TORCHAX: 原始版本的 fake_context_parallel_forward 方法被合并到 forward 中
+    # 原始签名: forward(inputs, conv_cache: Optional[Dict] = None) -> Tuple[Tensor, Dict]
+    # TORCHAX 签名: forward(inputs, feat_cache: Optional[List] = None, feat_idx: int = 0) -> Tuple[Tensor, int, List]
+    def forward(self, inputs: torch.Tensor, feat_cache=None, feat_idx: int = 0):
         if self.pad_mode == "replicate":
+            # replicate 模式：直接 pad，不使用缓存
             inputs = F.pad(inputs, self.time_causal_padding, mode="replicate")
-            # Add sharding constraint for TPU
-            success = False
-            try:
-                inputs = mark_sharding(inputs, P(None, None, None, None, ("dp", "tp")))
-                success = True
-            except ValueError:
-                pass
-            if not success:
-                try:
-                    inputs = mark_sharding(inputs, P(None, None, None, None, ("tp")))
-                    success = True
-                except ValueError:
-                    pass
-            if not success:
-                try:
-                    inputs = mark_sharding(inputs, P(None, None, None, None, ("dp")))
-                    success = True
-                except ValueError:
-                    pass
+            # TORCHAX: 添加 TPU sharding 约束
+            inputs = self._apply_sharding(inputs)
             output = self.conv(inputs)
             return output, feat_idx, feat_cache
         else:
-            # Wan-style caching
+            # TORCHAX: 使用 list-based feat_cache 替代 dict-based conv_cache
             kernel_size = self.time_kernel_size
             if feat_cache is not None and kernel_size > 1:
                 idx = feat_idx
+                # 保存当前输入的最后 CACHE_T 帧用于下次迭代
                 cache_x = inputs[:, :, -CACHE_T:, :, :].clone()
                 if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
                     cache_x = torch.cat([feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device), cache_x], dim=2)
                 
                 if feat_cache[idx] is not None:
+                    # 使用缓存的帧
                     cached_inputs = feat_cache[idx]
                     inputs = torch.cat([cached_inputs, inputs], dim=2)
                 else:
-                    # First time: replicate first frame
+                    # 首次调用：复制第一帧作为填充
                     cached_inputs = inputs[:, :, :1].repeat(1, 1, kernel_size - 1, 1, 1)
                     inputs = torch.cat([cached_inputs, inputs], dim=2)
                 
                 feat_cache[idx] = cache_x
                 feat_idx += 1
             elif kernel_size > 1:
-                # No cache, replicate first frame
+                # 无缓存模式：复制第一帧
                 cached_inputs = inputs[:, :, :1].repeat(1, 1, kernel_size - 1, 1, 1)
                 inputs = torch.cat([cached_inputs, inputs], dim=2)
             
-            # Add sharding constraint for TPU
-            success = False
-            try:
-                inputs = mark_sharding(inputs, P(None, None, None, None, ("dp", "tp")))
-                success = True
-            except ValueError:
-                pass
-            if not success:
-                try:
-                    inputs = mark_sharding(inputs, P(None, None, None, None, ("tp")))
-                    success = True
-                except ValueError:
-                    pass
-            if not success:
-                try:
-                    inputs = mark_sharding(inputs, P(None, None, None, None, ("dp")))
-                    success = True
-                except ValueError:
-                    pass
-            
+            # TORCHAX: 添加 TPU sharding 约束
+            inputs = self._apply_sharding(inputs)
             output = self.conv(inputs)
             return output, feat_idx, feat_cache
 
+    def _apply_sharding(self, inputs: torch.Tensor) -> torch.Tensor:
+        """TORCHAX: 尝试应用 TPU sharding 约束。"""
+        for spec in [P(None, None, None, None, ("dp", "tp")),
+                     P(None, None, None, None, ("tp",)),
+                     P(None, None, None, None, ("dp",))]:
+            try:
+                return mark_sharding(inputs, spec)
+            except ValueError:
+                continue
+        return inputs
+
+
+# ==================== CogVideoXSpatialNorm3D ====================
+# 原始版本签名: forward(f, zq, conv_cache: Optional[Dict] = None) -> Tuple[Tensor, Dict]
+# TORCHAX 版本签名: forward(f, zq, feat_cache=None, feat_idx=0) -> Tuple[Tensor, int, List]
 
 class CogVideoXSpatialNorm3D(nn.Module):
     r"""
     Spatially conditioned normalization as defined in https://huggingface.co/papers/2209.09002.
-    
-    This version uses Wan-style feat_cache for TPU compatibility.
+    This implementation is specific to 3D-video like data.
+
+    CogVideoXSafeConv3d is used instead of nn.Conv3d to avoid OOM in CogVideoX Model.
+
+    Args:
+        f_channels (`int`):
+            The number of channels for input to group normalization layer, and output of the spatial norm layer.
+        zq_channels (`int`):
+            The number of channels for the quantized vector as described in the paper.
+        groups (`int`):
+            Number of groups to separate the channels into for group normalization.
     """
 
     def __init__(
@@ -332,12 +312,15 @@ class CogVideoXSpatialNorm3D(nn.Module):
         groups: int = 32,
     ):
         super().__init__()
-        # Use optimized GroupNorm with JAX's Welford algorithm for memory efficiency
+        # TORCHAX: 使用优化的 GroupNorm 替代 nn.GroupNorm
         self.norm_layer = CogVideoXOptimizedGroupNorm(num_channels=f_channels, num_groups=groups, eps=1e-6, affine=True)
         self.conv_y = CogVideoXCausalConv3d(zq_channels, f_channels, kernel_size=1, stride=1)
         self.conv_b = CogVideoXCausalConv3d(zq_channels, f_channels, kernel_size=1, stride=1)
 
-    def forward(self, f: torch.Tensor, zq: torch.Tensor, feat_cache=None, feat_idx=0):
+    # TORCHAX: forward 签名改变
+    # 原始: forward(f, zq, conv_cache: Optional[Dict] = None) -> Tuple[Tensor, Dict]
+    # 现在: forward(f, zq, feat_cache=None, feat_idx=0) -> Tuple[Tensor, int, List]
+    def forward(self, f: torch.Tensor, zq: torch.Tensor, feat_cache=None, feat_idx: int = 0):
         if f.shape[2] > 1 and f.shape[2] % 2 == 1:
             f_first, f_rest = f[:, :, :1], f[:, :, 1:]
             f_first_size, f_rest_size = f_first.shape[-3:], f_rest.shape[-3:]
@@ -348,6 +331,7 @@ class CogVideoXSpatialNorm3D(nn.Module):
         else:
             zq = F.interpolate(zq, size=f.shape[-3:])
 
+        # TORCHAX: 使用 feat_cache/feat_idx 替代 conv_cache dict
         conv_y, feat_idx, feat_cache = self.conv_y(zq, feat_cache=feat_cache, feat_idx=feat_idx)
         conv_b, feat_idx, feat_cache = self.conv_b(zq, feat_cache=feat_cache, feat_idx=feat_idx)
 
@@ -356,11 +340,35 @@ class CogVideoXSpatialNorm3D(nn.Module):
         return new_f, feat_idx, feat_cache
 
 
+# ==================== CogVideoXResnetBlock3D ====================
+# 原始版本签名: forward(inputs, temb, zq, conv_cache: Optional[Dict] = None) -> Tuple[Tensor, Dict]
+# TORCHAX 版本签名: forward(inputs, temb, zq, feat_cache=None, feat_idx=0) -> Tuple[Tensor, int, List]
+
 class CogVideoXResnetBlock3D(nn.Module):
     r"""
     A 3D ResNet block used in the CogVideoX model.
-    
-    This version uses Wan-style feat_cache for TPU compatibility.
+
+    Args:
+        in_channels (`int`):
+            Number of input channels.
+        out_channels (`int`, *optional*):
+            Number of output channels. If None, defaults to `in_channels`.
+        dropout (`float`, defaults to `0.0`):
+            Dropout rate.
+        temb_channels (`int`, defaults to `512`):
+            Number of time embedding channels.
+        groups (`int`, defaults to `32`):
+            Number of groups to separate the channels into for group normalization.
+        eps (`float`, defaults to `1e-6`):
+            Epsilon value for normalization layers.
+        non_linearity (`str`, defaults to `"swish"`):
+            Activation function to use.
+        conv_shortcut (bool, defaults to `False`):
+            Whether or not to use a convolution shortcut.
+        spatial_norm_dim (`int`, *optional*):
+            The dimension to use for spatial norm if it is to be used instead of group norm.
+        pad_mode (str, defaults to `"first"`):
+            Padding mode.
     """
 
     def __init__(
@@ -387,7 +395,7 @@ class CogVideoXResnetBlock3D(nn.Module):
         self.spatial_norm_dim = spatial_norm_dim
 
         if spatial_norm_dim is None:
-            # Use optimized GroupNorm with JAX's Welford algorithm for memory efficiency
+            # TORCHAX: 使用优化的 GroupNorm 替代 nn.GroupNorm
             self.norm1 = CogVideoXOptimizedGroupNorm(num_channels=in_channels, num_groups=groups, eps=eps)
             self.norm2 = CogVideoXOptimizedGroupNorm(num_channels=out_channels, num_groups=groups, eps=eps)
         else:
@@ -424,13 +432,16 @@ class CogVideoXResnetBlock3D(nn.Module):
                     in_channels=in_channels, out_channels=out_channels, kernel_size=1, stride=1, padding=0
                 )
 
+    # TORCHAX: forward 签名改变
+    # 原始: forward(inputs, temb, zq, conv_cache: Optional[Dict] = None) -> Tuple[Tensor, Dict]
+    # 现在: forward(inputs, temb, zq, feat_cache=None, feat_idx=0) -> Tuple[Tensor, int, List]
     def forward(
         self,
         inputs: torch.Tensor,
         temb: Optional[torch.Tensor] = None,
         zq: Optional[torch.Tensor] = None,
         feat_cache=None,
-        feat_idx=0,
+        feat_idx: int = 0,
     ):
         hidden_states = inputs
 
@@ -464,11 +475,38 @@ class CogVideoXResnetBlock3D(nn.Module):
         return hidden_states, feat_idx, feat_cache
 
 
+# ==================== CogVideoXDownBlock3D ====================
+# 原始版本签名: forward(hidden_states, temb, zq, conv_cache: Optional[Dict] = None) -> Tuple[Tensor, Dict]
+# TORCHAX 版本签名: forward(hidden_states, temb, zq, feat_cache=None, feat_idx=0) -> Tuple[Tensor, int, List]
+# TORCHAX: 移除了 gradient_checkpointing 相关逻辑（TPU 不需要）
+
 class CogVideoXDownBlock3D(nn.Module):
     r"""
     A downsampling block used in the CogVideoX model.
-    
-    This version uses Wan-style feat_cache for TPU compatibility.
+
+    Args:
+        in_channels (`int`):
+            Number of input channels.
+        out_channels (`int`, *optional*):
+            Number of output channels. If None, defaults to `in_channels`.
+        temb_channels (`int`, defaults to `512`):
+            Number of time embedding channels.
+        num_layers (`int`, defaults to `1`):
+            Number of resnet layers.
+        dropout (`float`, defaults to `0.0`):
+            Dropout rate.
+        resnet_eps (`float`, defaults to `1e-6`):
+            Epsilon value for normalization layers.
+        resnet_act_fn (`str`, defaults to `"swish"`):
+            Activation function to use.
+        resnet_groups (`int`, defaults to `32`):
+            Number of groups to separate the channels into for group normalization.
+        add_downsample (`bool`, defaults to `True`):
+            Whether or not to use a downsampling layer. If not used, output dimension would be same as input dimension.
+        compress_time (`bool`, defaults to `False`):
+            Whether or not to downsample across temporal dimension.
+        pad_mode (str, defaults to `"first"`):
+            Padding mode.
     """
 
     _supports_gradient_checkpointing = True
@@ -520,14 +558,17 @@ class CogVideoXDownBlock3D(nn.Module):
 
         self.gradient_checkpointing = False
 
+    # TORCHAX: forward 签名改变，移除 gradient_checkpointing 逻辑
     def forward(
         self,
         hidden_states: torch.Tensor,
         temb: Optional[torch.Tensor] = None,
         zq: Optional[torch.Tensor] = None,
         feat_cache=None,
-        feat_idx=0,
+        feat_idx: int = 0,
     ):
+        r"""Forward method of the `CogVideoXDownBlock3D` class."""
+        # TORCHAX: 移除了原始版本的 gradient_checkpointing 分支
         for resnet in self.resnets:
             hidden_states, feat_idx, feat_cache = resnet(
                 hidden_states, temb, zq, feat_cache=feat_cache, feat_idx=feat_idx
@@ -540,11 +581,33 @@ class CogVideoXDownBlock3D(nn.Module):
         return hidden_states, feat_idx, feat_cache
 
 
+# ==================== CogVideoXMidBlock3D ====================
+# 原始版本签名: forward(hidden_states, temb, zq, conv_cache: Optional[Dict] = None) -> Tuple[Tensor, Dict]
+# TORCHAX 版本签名: forward(hidden_states, temb, zq, feat_cache=None, feat_idx=0) -> Tuple[Tensor, int, List]
+
 class CogVideoXMidBlock3D(nn.Module):
     r"""
     A middle block used in the CogVideoX model.
-    
-    This version uses Wan-style feat_cache for TPU compatibility.
+
+    Args:
+        in_channels (`int`):
+            Number of input channels.
+        temb_channels (`int`, defaults to `512`):
+            Number of time embedding channels.
+        dropout (`float`, defaults to `0.0`):
+            Dropout rate.
+        num_layers (`int`, defaults to `1`):
+            Number of resnet layers.
+        resnet_eps (`float`, defaults to `1e-6`):
+            Epsilon value for normalization layers.
+        resnet_act_fn (`str`, defaults to `"swish"`):
+            Activation function to use.
+        resnet_groups (`int`, defaults to `32`):
+            Number of groups to separate the channels into for group normalization.
+        spatial_norm_dim (`int`, *optional*):
+            The dimension to use for spatial norm if it is to be used instead of group norm.
+        pad_mode (str, defaults to `"first"`):
+            Padding mode.
     """
 
     _supports_gradient_checkpointing = True
@@ -582,14 +645,17 @@ class CogVideoXMidBlock3D(nn.Module):
 
         self.gradient_checkpointing = False
 
+    # TORCHAX: forward 签名改变，移除 gradient_checkpointing 逻辑
     def forward(
         self,
         hidden_states: torch.Tensor,
         temb: Optional[torch.Tensor] = None,
         zq: Optional[torch.Tensor] = None,
         feat_cache=None,
-        feat_idx=0,
+        feat_idx: int = 0,
     ):
+        r"""Forward method of the `CogVideoXMidBlock3D` class."""
+        # TORCHAX: 移除了原始版本的 gradient_checkpointing 分支
         for resnet in self.resnets:
             hidden_states, feat_idx, feat_cache = resnet(
                 hidden_states, temb, zq, feat_cache=feat_cache, feat_idx=feat_idx
@@ -598,11 +664,39 @@ class CogVideoXMidBlock3D(nn.Module):
         return hidden_states, feat_idx, feat_cache
 
 
+# ==================== CogVideoXUpBlock3D ====================
+# 原始版本签名: forward(hidden_states, temb, zq, conv_cache: Optional[Dict] = None) -> Tuple[Tensor, Dict]
+# TORCHAX 版本签名: forward(hidden_states, temb, zq, feat_cache=None, feat_idx=0) -> Tuple[Tensor, int, List]
+
 class CogVideoXUpBlock3D(nn.Module):
     r"""
     An upsampling block used in the CogVideoX model.
-    
-    This version uses Wan-style feat_cache for TPU compatibility.
+
+    Args:
+        in_channels (`int`):
+            Number of input channels.
+        out_channels (`int`, *optional*):
+            Number of output channels. If None, defaults to `in_channels`.
+        temb_channels (`int`, defaults to `512`):
+            Number of time embedding channels.
+        dropout (`float`, defaults to `0.0`):
+            Dropout rate.
+        num_layers (`int`, defaults to `1`):
+            Number of resnet layers.
+        resnet_eps (`float`, defaults to `1e-6`):
+            Epsilon value for normalization layers.
+        resnet_act_fn (`str`, defaults to `"swish"`):
+            Activation function to use.
+        resnet_groups (`int`, defaults to `32`):
+            Number of groups to separate the channels into for group normalization.
+        spatial_norm_dim (`int`, defaults to `16`):
+            The dimension to use for spatial norm if it is to be used instead of group norm.
+        add_upsample (`bool`, defaults to `True`):
+            Whether or not to use a upsampling layer. If not used, output dimension would be same as input dimension.
+        compress_time (`bool`, defaults to `False`):
+            Whether or not to downsample across temporal dimension.
+        pad_mode (str, defaults to `"first"`):
+            Padding mode.
     """
 
     def __init__(
@@ -654,14 +748,17 @@ class CogVideoXUpBlock3D(nn.Module):
 
         self.gradient_checkpointing = False
 
+    # TORCHAX: forward 签名改变，移除 gradient_checkpointing 逻辑
     def forward(
         self,
         hidden_states: torch.Tensor,
         temb: Optional[torch.Tensor] = None,
         zq: Optional[torch.Tensor] = None,
         feat_cache=None,
-        feat_idx=0,
+        feat_idx: int = 0,
     ):
+        r"""Forward method of the `CogVideoXUpBlock3D` class."""
+        # TORCHAX: 移除了原始版本的 gradient_checkpointing 分支
         for resnet in self.resnets:
             hidden_states, feat_idx, feat_cache = resnet(
                 hidden_states, temb, zq, feat_cache=feat_cache, feat_idx=feat_idx
@@ -674,11 +771,29 @@ class CogVideoXUpBlock3D(nn.Module):
         return hidden_states, feat_idx, feat_cache
 
 
+# ==================== CogVideoXEncoder3D ====================
+# 原始版本签名: forward(sample, temb, conv_cache: Optional[Dict] = None) -> Tuple[Tensor, Dict]
+# TORCHAX 版本签名: forward(sample, temb, feat_cache=None) -> Tuple[Tensor, List]
+
 class CogVideoXEncoder3D(nn.Module):
     r"""
-    The `CogVideoXEncoder3D` layer of a variational autoencoder.
-    
-    This version uses Wan-style feat_cache for TPU compatibility.
+    The `CogVideoXEncoder3D` layer of a variational autoencoder that encodes its input into a latent representation.
+
+    Args:
+        in_channels (`int`, *optional*, defaults to 3):
+            The number of input channels.
+        out_channels (`int`, *optional*, defaults to 3):
+            The number of output channels.
+        down_block_types (`Tuple[str, ...]`, *optional*, defaults to `("DownEncoderBlock2D",)`):
+            The types of down blocks to use.
+        block_out_channels (`Tuple[int, ...]`, *optional*, defaults to `(64,)`):
+            The number of output channels for each block.
+        act_fn (`str`, *optional*, defaults to `"silu"`):
+            The activation function to use.
+        layers_per_block (`int`, *optional*, defaults to 2):
+            The number of layers per block.
+        norm_num_groups (`int`, *optional*, defaults to 32):
+            The number of groups for normalization.
     """
 
     _supports_gradient_checkpointing = True
@@ -787,11 +902,30 @@ class CogVideoXEncoder3D(nn.Module):
         return hidden_states, feat_cache
 
 
+# ==================== CogVideoXDecoder3D ====================
+# 原始版本签名: forward(sample, temb, conv_cache: Optional[Dict] = None) -> Tuple[Tensor, Dict]
+# TORCHAX 版本签名: forward(sample, temb, feat_cache=None) -> Tuple[Tensor, List]
+
 class CogVideoXDecoder3D(nn.Module):
     r"""
-    The `CogVideoXDecoder3D` layer of a variational autoencoder.
-    
-    This version uses Wan-style feat_cache for TPU compatibility.
+    The `CogVideoXDecoder3D` layer of a variational autoencoder that decodes its latent representation into an output
+    sample.
+
+    Args:
+        in_channels (`int`, *optional*, defaults to 3):
+            The number of input channels.
+        out_channels (`int`, *optional*, defaults to 3):
+            The number of output channels.
+        up_block_types (`Tuple[str, ...]`, *optional*, defaults to `("UpDecoderBlock2D",)`):
+            The types of up blocks to use.
+        block_out_channels (`Tuple[int, ...]`, *optional*, defaults to `(64,)`):
+            The number of output channels for each block.
+        act_fn (`str`, *optional*, defaults to `"silu"`):
+            The activation function to use.
+        layers_per_block (`int`, *optional*, defaults to 2):
+            The number of layers per block.
+        norm_num_groups (`int`, *optional*, defaults to 32):
+            The number of groups for normalization.
     """
 
     _supports_gradient_checkpointing = True
@@ -911,11 +1045,44 @@ class CogVideoXDecoder3D(nn.Module):
         return hidden_states, feat_cache
 
 
+# ==================== AutoencoderKLCogVideoX ====================
+# 这是主模型类，整合了 Encoder 和 Decoder。
+#
+# 主要 TORCHAX 改动：
+# 1. 添加 clear_cache() 方法初始化 list-based feat_cache
+# 2. _encode/_decode 使用 feat_cache 替代 conv_cache
+# 3. 添加 _count_causal_conv3d() 辅助方法
+
 class AutoencoderKLCogVideoX(ModelMixin, AutoencoderMixin, ConfigMixin, FromOriginalModelMixin):
     r"""
-    A VAE model with KL loss for encoding images into latents and decoding latent representations into images.
-    
-    This version uses Wan-style feat_cache for TPU compatibility.
+    A VAE model with KL loss for encoding images into latents and decoding latent representations into images. Used in
+    [CogVideoX](https://github.com/THUDM/CogVideo).
+
+    This model inherits from [`ModelMixin`]. Check the superclass documentation for it's generic methods implemented
+    for all models (such as downloading or saving).
+
+    Parameters:
+        in_channels (int, *optional*, defaults to 3): Number of channels in the input image.
+        out_channels (int,  *optional*, defaults to 3): Number of channels in the output.
+        down_block_types (`Tuple[str]`, *optional*, defaults to `("DownEncoderBlock2D",)`):
+            Tuple of downsample block types.
+        up_block_types (`Tuple[str]`, *optional*, defaults to `("UpDecoderBlock2D",)`):
+            Tuple of upsample block types.
+        block_out_channels (`Tuple[int]`, *optional*, defaults to `(64,)`):
+            Tuple of block output channels.
+        act_fn (`str`, *optional*, defaults to `"silu"`): The activation function to use.
+        sample_size (`int`, *optional*, defaults to `32`): Sample input size.
+        scaling_factor (`float`, *optional*, defaults to `1.15258426`):
+            The component-wise standard deviation of the trained latent space computed using the first batch of the
+            training set. This is used to scale the latent space to have unit variance when training the diffusion
+            model. The latents are scaled with the formula `z = z * scaling_factor` before being passed to the
+            diffusion model. When decoding, the latents are scaled back to the original scale with the formula: `z = 1
+            / scaling_factor * z`. For more details, refer to sections 4.3.2 and D.1 of the [High-Resolution Image
+            Synthesis with Latent Diffusion Models](https://huggingface.co/papers/2112.10752) paper.
+        force_upcast (`bool`, *optional*, default to `True`):
+            If enabled it will force the VAE to run in float32 for high image resolution pipelines, such as SD-XL. VAE
+            can be fine-tuned / trained to a lower range without losing too much precision in which case `force_upcast`
+            can be set to `False` - see: https://huggingface.co/madebyollin/sdxl-vae-fp16-fix
     """
 
     _supports_gradient_checkpointing = True
