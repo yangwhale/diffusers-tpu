@@ -15,87 +15,68 @@
 """
 Pure JAX implementation of Wan VAE (AutoencoderKLWan).
 
-This version removes all Flax NNX dependencies and uses:
-- Pure functions with explicit pytree parameters
-- jax.lax.conv_general_dilated instead of nnx.Conv
-- jax.lax.scan for frame-by-frame decoding
-- Explicit cache passing (no mutable state)
+=============================================================================
+FLAX NNX → PURE JAX 改造指南
+=============================================================================
 
-Performance improvements over NNX version:
-- No pytree=False hack (full JAX tracing optimization)
-- No nnx.split/merge overhead
-- No module instantiation overhead
-- Faster compilation and cache loading
+本文件从 autoencoder_kl_wan_flax.py 改造而来，主要改动点用 # PURE_JAX: 标记。
+
+核心改动原则：
+1. nnx.Module 类 → 纯函数 + Params 字典
+2. self.xxx 属性 → params['xxx'] 参数传递
+3. nnx.Conv → jax.lax.conv_general_dilated
+4. nnx.Param → 普通 jnp.ndarray 在 params 字典中
+5. self._feat_map 可变状态 → cache 显式传递和返回
+6. nnx.jit → jax.jit（无需 pytree=False hack）
+
+改造后的优势：
+- 无 nnx.split/merge 开销
+- 无 pytree=False 导致的 tracing 限制
+- 纯函数式，更适合 JAX 的编译优化
+- 更透明的参数管理
+
+=============================================================================
 """
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
-import functools
 
 import jax
 import jax.numpy as jnp
-from jax import lax
+# PURE_JAX: 移除 from flax import nnx
+from jax import lax  # PURE_JAX: 用于底层卷积
+
 from jax.sharding import PartitionSpec as P
 
-# Type aliases for pytree parameters
-Array = jnp.ndarray
+# PURE_JAX: 类型别名，替代 nnx.Module
 Params = Dict[str, Any]
-Cache = Optional[Array]
+Cache = Optional[jnp.ndarray]
 CacheList = List[Cache]
+
+# FLAX: Flax equivalent of interop.torch_view(jax.lax.with_sharding_constraint)
+def mark_sharding(inputs, spec):
+    try:
+        return jax.lax.with_sharding_constraint(inputs, spec)
+    except (ValueError, Exception):
+        return inputs
 
 CACHE_T = 2
 
 
 # =============================================================================
-# Sharding Utilities
+# PURE_JAX: 卷积基础函数 (替代 nnx.Conv)
 # =============================================================================
 
-def mark_sharding(inputs: Array, spec: P) -> Array:
-    """Apply sharding constraint, silently ignore if not applicable."""
-    try:
-        return lax.with_sharding_constraint(inputs, spec)
-    except (ValueError, Exception):
-        return inputs
-
-
-def try_shard_on_width(x: Array) -> Array:
-    """Try to shard on width dimension (NTHWC format)."""
-    for spec in [P(None, None, None, ("dp", "tp"), None),
-                 P(None, None, None, ("tp",), None),
-                 P(None, None, None, ("dp",), None)]:
-        try:
-            return mark_sharding(x, spec)
-        except ValueError:
-            continue
-    return x
-
-
-# =============================================================================
-# Pure Function Implementations
-# =============================================================================
-
-def conv3d(
-    params: Params,
-    x: Array,
-    strides: Tuple[int, int, int] = (1, 1, 1),
-    padding: str = "VALID",
-) -> Array:
+def conv3d(params: Params, x: jnp.ndarray, strides=(1, 1, 1), padding="VALID") -> jnp.ndarray:
     """
-    Pure 3D convolution using lax.conv_general_dilated.
+    PURE_JAX: 替代 nnx.Conv 的 3D 卷积
     
-    Args:
-        params: {'kernel': (T, H, W, In, Out), 'bias': (Out,)}
-        x: Input tensor (B, T, H, W, C)
-        strides: Convolution strides
-        padding: Padding mode
-    
-    Returns:
-        Output tensor (B, T', H', W', Out)
+    params: {'kernel': (T, H, W, In, Out), 'bias': (Out,)}
+    x: (B, T, H, W, C) - NTHWC 格式
     """
-    kernel = params['kernel']
     out = lax.conv_general_dilated(
         lhs=x,
-        rhs=kernel,
+        rhs=params['kernel'],
         window_strides=strides,
         padding=padding,
         dimension_numbers=('NTHWC', 'THWIO', 'NTHWC'),
@@ -105,28 +86,16 @@ def conv3d(
     return out
 
 
-def conv2d(
-    params: Params,
-    x: Array,
-    strides: Tuple[int, int] = (1, 1),
-    padding: Union[str, Tuple] = "VALID",
-) -> Array:
+def conv2d(params: Params, x: jnp.ndarray, strides=(1, 1), padding="VALID") -> jnp.ndarray:
     """
-    Pure 2D convolution using lax.conv_general_dilated.
+    PURE_JAX: 替代 nnx.Conv 的 2D 卷积
     
-    Args:
-        params: {'kernel': (H, W, In, Out), 'bias': (Out,)}
-        x: Input tensor (B, H, W, C)
-        strides: Convolution strides
-        padding: Padding mode or explicit padding
-    
-    Returns:
-        Output tensor (B, H', W', Out)
+    params: {'kernel': (H, W, In, Out), 'bias': (Out,)}
+    x: (B, H, W, C) - NHWC 格式
     """
-    kernel = params['kernel']
     out = lax.conv_general_dilated(
         lhs=x,
-        rhs=kernel,
+        rhs=params['kernel'],
         window_strides=strides,
         padding=padding,
         dimension_numbers=('NHWC', 'HWIO', 'NHWC'),
@@ -136,104 +105,36 @@ def conv2d(
     return out
 
 
-def conv3d_causal(
-    params: Params,
-    x: Array,
-    cache: Cache,
-    padding_config: Tuple[int, ...],
-) -> Tuple[Array, Cache]:
-    """
-    Causal 3D convolution with cache support.
-    
-    Args:
-        params: {'kernel': (T, H, W, In, Out), 'bias': (Out,)}
-        x: Input tensor (B, T, H, W, C)
-        cache: Previous frames cache (B, cache_T, H, W, C) or None
-        padding_config: (W_left, W_right, H_left, H_right, T_left, T_right)
-    
-    Returns:
-        output: Convolution result
-        new_cache: Updated cache for next call
-    """
-    padding = list(padding_config)
-    
-    # Concatenate cache if available
-    if cache is not None and padding[4] > 0:
-        x = jnp.concatenate([cache, x], axis=1)
-        padding[4] -= cache.shape[1]
-    
-    # Build new cache before padding
-    new_cache = x[:, -CACHE_T:, :, :, :]
-    
-    # Apply padding (T, H, W dimensions)
-    pad_width = [
-        (0, 0),                    # Batch
-        (padding[4], padding[5]),  # Time
-        (padding[2], padding[3]),  # Height
-        (padding[0], padding[1]),  # Width
-        (0, 0),                    # Channels
-    ]
-    x = jnp.pad(x, pad_width, mode='constant', constant_values=0)
-    
-    # Apply sharding
-    x = try_shard_on_width(x)
-    
-    # Convolution
-    out = conv3d(params, x, strides=(1, 1, 1), padding="VALID")
-    
-    return out, new_cache
-
-
-def rms_norm(params: Params, x: Array) -> Array:
-    """
-    RMS normalization.
-    
-    Args:
-        params: {'gamma': (dim,), 'bias': (dim,) optional}
-        x: Input tensor (..., dim)
-    
-    Returns:
-        Normalized tensor
-    """
-    scale = jnp.sqrt(x.shape[-1]).astype(x.dtype)
-    norm = jnp.linalg.norm(x, axis=-1, keepdims=True)
-    norm = jnp.maximum(norm, 1e-12)
-    x_normalized = x / norm
-    out = x_normalized * scale * params['gamma']
-    if 'bias' in params and params['bias'] is not None:
-        out = out + params['bias']
-    return out
-
-
 # =============================================================================
-# AvgDown3D / DupUp3D Pure Functions
+# AvgDown3D: nnx.Module → 纯函数
 # =============================================================================
+# PURE_JAX: 原 class AvgDown3D(nnx.Module) 改为纯函数
+# PURE_JAX: __init__ 中的 self.xxx = xxx 不再需要，参数直接传入函数
 
 def avg_down_3d(
-    x: Array,
+    x: jnp.ndarray,
     in_channels: int,
     out_channels: int,
     factor_t: int,
     factor_s: int = 1,
-) -> Array:
+) -> jnp.ndarray:
     """
-    Average pooling based downsampling for 3D data.
-    
-    Args:
-        x: Input (B, T, H, W, C)
-        in_channels, out_channels: Channel dimensions
-        factor_t, factor_s: Temporal and spatial downsampling factors
+    PURE_JAX: 原 AvgDown3D.__call__ 方法
+    无需 params，因为此函数无可学习参数
     """
+    # FLAX: x is (B, T, H, W, C) in NTHWC format, not (B, C, T, H, W)
     B, T, H, W, C = x.shape
     factor = factor_t * factor_s * factor_s
     group_size = in_channels * factor // out_channels
-    
+
     pad_t = (factor_t - T % factor_t) % factor_t
     if pad_t > 0:
+        # FLAX: jnp.pad instead of F.pad, different axis order
         pad_width = [(0, 0), (pad_t, 0), (0, 0), (0, 0), (0, 0)]
         x = jnp.pad(x, pad_width, mode='constant', constant_values=0)
         T = x.shape[1]
-    
+
+    # FLAX: reshape for NTHWC format
     x = x.reshape(B, T//factor_t, factor_t, H//factor_s, factor_s, W//factor_s, factor_s, C)
     x = x.transpose(0, 1, 3, 5, 7, 2, 4, 6)
     x = x.reshape(B, T//factor_t, H//factor_s, W//factor_s, C * factor)
@@ -242,627 +143,554 @@ def avg_down_3d(
     return x
 
 
+# =============================================================================
+# DupUp3D: nnx.Module → 纯函数
+# =============================================================================
+
 def dup_up_3d(
-    x: Array,
+    x: jnp.ndarray,
     in_channels: int,
     out_channels: int,
     factor_t: int,
     factor_s: int = 1,
     first_chunk: bool = False,
-) -> Array:
-    """
-    Duplication based upsampling for 3D data.
-    
-    Args:
-        x: Input (B, T, H, W, C)
-        in_channels, out_channels: Channel dimensions
-        factor_t, factor_s: Temporal and spatial upsampling factors
-        first_chunk: Whether this is the first chunk (affects output slicing)
-    """
+) -> jnp.ndarray:
+    """PURE_JAX: 原 DupUp3D.__call__ 方法"""
+    # FLAX: x is (B, T, H, W, C)
     B, T, H, W, C = x.shape
     factor = factor_t * factor_s * factor_s
     repeats = out_channels * factor // in_channels
-    
+
+    # FLAX: jnp.repeat instead of repeat_interleave
     x = jnp.repeat(x[:, :, :, :, :, None], repeats, axis=5).reshape(B, T, H, W, C * repeats)
     x = x.reshape(B, T, H, W, out_channels, factor_t, factor_s, factor_s)
     x = x.transpose(0, 1, 5, 2, 6, 3, 7, 4)
     x = x.reshape(B, T * factor_t, H * factor_s, W * factor_s, out_channels)
-    
+
     if first_chunk:
         x = x[:, factor_t - 1:, :, :, :]
     return x
 
 
 # =============================================================================
-# Resample Pure Functions
+# WanCausalConv3d: nnx.Module → 纯函数
 # =============================================================================
+# PURE_JAX: 原 class WanCausalConv3d(nnx.Module)
+# PURE_JAX: __init__ 中 self.conv = nnx.Conv(...) → params['conv'] 传入
+# PURE_JAX: __call__ → wan_causal_conv3d 函数
+
+def get_causal_padding(kernel_size, stride, padding):
+    """PURE_JAX: 计算因果卷积的 padding 配置"""
+    if isinstance(kernel_size, int):
+        kernel_size = (kernel_size,) * 3
+    if isinstance(stride, int):
+        stride = (stride,) * 3
+    if isinstance(padding, int):
+        padding = (padding,) * 3
+    # (W_left, W_right, H_left, H_right, T_left, T_right)
+    return (padding[2], padding[2], padding[1], padding[1], 2 * padding[0], 0)
+
+
+def wan_causal_conv3d(
+    params: Params,
+    x: jnp.ndarray,
+    cache_x: Cache = None,
+    padding_config: Tuple[int, ...] = None,
+) -> jnp.ndarray:
+    """
+    PURE_JAX: 原 WanCausalConv3d.__call__ 方法
+    
+    params: {'kernel': ..., 'bias': ...}  # PURE_JAX: 原 self.conv 的参数
+    padding_config: 从 get_causal_padding 获取
+    """
+    # FLAX: x is (B, T, H, W, C)
+    padding = list(padding_config)
+    if cache_x is not None and padding[4] > 0:
+        x = jnp.concatenate([cache_x, x], axis=1)
+        padding[4] -= cache_x.shape[1]
+
+    # FLAX: jnp.pad for NTHWC format
+    pad_width = [
+        (0, 0),  # Batch
+        (padding[4], padding[5]),  # Time
+        (padding[2], padding[3]),  # Height
+        (padding[0], padding[1]),  # Width
+        (0, 0),  # Channels
+    ]
+    x = jnp.pad(x, pad_width, mode='constant', constant_values=0)
+
+    # Sharding along width (matches TorchAx mark_sharding on height in NCTHW)
+    success = False
+    try:
+        x = mark_sharding(x, P(None, None, None, ("dp", "tp"), None))
+        success = True
+    except ValueError:
+        pass
+    if not success:
+        try:
+            x = mark_sharding(x, P(None, None, None, ("tp",), None))
+            success = True
+        except ValueError:
+            pass
+    if not success:
+        try:
+            x = mark_sharding(x, P(None, None, None, ("dp",), None))
+        except ValueError:
+            pass
+
+    # PURE_JAX: self.conv(x) → conv3d(params, x)
+    return conv3d(params, x, strides=(1, 1, 1), padding="VALID")
+
+
+# =============================================================================
+# WanRMS_norm: nnx.Module → 纯函数
+# =============================================================================
+# PURE_JAX: 原 self.gamma = nnx.Param(...) → params['gamma']
+
+def rms_norm(params: Params, x: jnp.ndarray) -> jnp.ndarray:
+    """
+    PURE_JAX: 原 WanRMS_norm.__call__ 方法
+    
+    params: {'gamma': (dim,), 'bias': (dim,) 可选}
+    """
+    # FLAX: F.normalize -> manual L2 normalize along channel dim
+    scale = jnp.sqrt(x.shape[-1]).astype(x.dtype)  # PURE_JAX: 动态计算 scale
+    norm = jnp.linalg.norm(x, axis=-1, keepdims=True)
+    norm = jnp.maximum(norm, 1e-12)
+    x_normalized = x / norm
+    out = x_normalized * scale * params['gamma']  # PURE_JAX: params['gamma'] 替代 self.gamma.value
+    if 'bias' in params and params['bias'] is not None:
+        out = out + params['bias']
+    return out
+
+
+# =============================================================================
+# WanResample: nnx.Module → 纯函数
+# =============================================================================
+# PURE_JAX: 最复杂的改造之一
+# PURE_JAX: 原 self.resample_conv, self.time_conv → params['resample_conv'], params['time_conv']
+# PURE_JAX: 根据 mode 拆分为多个函数
 
 def resample_upsample_3d(
     params: Params,
-    x: Array,
-    cache: CacheList,
-    cache_idx: int,
+    x: jnp.ndarray,
     dim: int,
-) -> Tuple[Array, int, CacheList]:
-    """
-    Upsample3D: time_conv (temporal) + spatial upsample + resample_conv.
-    """
+    feat_cache: CacheList = None,
+    feat_idx: int = 0,
+) -> Tuple[jnp.ndarray, int, CacheList]:
+    """PURE_JAX: 原 WanResample.__call__ 的 upsample3d 分支"""
     B, T, H, W, C = x.shape
-    
-    # Time convolution
-    if cache[cache_idx] is None:
-        cache[cache_idx] = (None,)
-        cache_idx += 1
-    else:
-        cache_x = x[:, -CACHE_T:, :, :, :]
-        if cache_x.shape[1] < 2 and cache[cache_idx] is not None and cache[cache_idx][0] is not None:
-            cache_x = jnp.concatenate([cache[cache_idx][0][:, -1:, :, :, :], cache_x], axis=1)
-        if cache_x.shape[1] < 2 and cache[cache_idx] is not None and cache[cache_idx][0] is None:
-            cache_x = jnp.concatenate([jnp.zeros_like(cache_x), cache_x], axis=1)
-        
-        time_conv_params = params['time_conv']
-        padding_config = (0, 0, 0, 0, 2, 0)  # (1, 0, 0) padding in causal conv
-        
-        if cache[cache_idx][0] is None:
-            x, _ = conv3d_causal(time_conv_params, x, None, padding_config)
+
+    if feat_cache is not None:
+        idx = feat_idx
+        if feat_cache[idx] is None:
+            feat_cache[idx] = (None,)
+            feat_idx += 1
         else:
-            x, _ = conv3d_causal(time_conv_params, x, cache[cache_idx][0], padding_config)
-        
-        cache[cache_idx] = (cache_x,)
-        cache_idx += 1
-        
-        # Reshape for temporal upsample
-        x = x.reshape(B, T, H, W, 2, dim)
-        x = x.transpose(0, 1, 4, 2, 3, 5).reshape(B, T * 2, H, W, dim)
-    
+            cache_x = x[:, -CACHE_T:, :, :, :]
+            if cache_x.shape[1] < 2 and feat_cache[idx] is not None and feat_cache[idx][0] is not None:
+                cache_x = jnp.concatenate([feat_cache[idx][0][:, -1:, :, :, :], cache_x], axis=1)
+            if cache_x.shape[1] < 2 and feat_cache[idx] is not None and feat_cache[idx][0] is None:
+                cache_x = jnp.concatenate([jnp.zeros_like(cache_x), cache_x], axis=1)
+            
+            # PURE_JAX: self.time_conv(x, ...) → wan_causal_conv3d(params['time_conv'], x, ...)
+            time_conv_padding = get_causal_padding((3, 1, 1), 1, (1, 0, 0))
+            if feat_cache[idx][0] is None:
+                x = wan_causal_conv3d(params['time_conv'], x, None, time_conv_padding)
+            else:
+                x = wan_causal_conv3d(params['time_conv'], x, feat_cache[idx][0], time_conv_padding)
+            feat_cache[idx] = (cache_x,)
+            feat_idx += 1
+
+            # FLAX: reshape for NTHWC
+            x = x.reshape(B, T, H, W, 2, dim)
+            x = x.transpose(0, 1, 4, 2, 3, 5).reshape(B, T * 2, H, W, dim)
+
     T_curr = x.shape[1]
     C_curr = x.shape[4]
     x = x.reshape(B * T_curr, H, W, C_curr)
-    
-    # Spatial upsample (nearest neighbor 2x)
+
+    # FLAX: jax.image.resize instead of nn.Upsample
     x = jax.image.resize(x, (B * T_curr, H * 2, W * 2, C_curr), method='nearest')
     
-    # Resample conv (2D)
+    # PURE_JAX: self.resample_conv(x) → conv2d(params['resample_conv'], x, ...)
     x = conv2d(params['resample_conv'], x, strides=(1, 1), padding=((1, 1), (1, 1)))
-    
+
     H_new, W_new = x.shape[1], x.shape[2]
     x = x.reshape(B, T_curr, H_new, W_new, x.shape[-1])
-    
-    return x, cache_idx, cache
+
+    return x, feat_idx, feat_cache
 
 
-def resample_upsample_2d(
-    params: Params,
-    x: Array,
-) -> Array:
-    """
-    Upsample2D: spatial upsample + resample_conv.
-    """
+def resample_upsample_2d(params: Params, x: jnp.ndarray) -> jnp.ndarray:
+    """PURE_JAX: 原 WanResample.__call__ 的 upsample2d 分支"""
     B, T, H, W, C = x.shape
     x = x.reshape(B * T, H, W, C)
     
-    # Spatial upsample (nearest neighbor 2x)
     x = jax.image.resize(x, (B * T, H * 2, W * 2, C), method='nearest')
-    
-    # Resample conv (2D)
     x = conv2d(params['resample_conv'], x, strides=(1, 1), padding=((1, 1), (1, 1)))
     
     H_new, W_new = x.shape[1], x.shape[2]
-    x = x.reshape(B, T, H_new, W_new, x.shape[-1])
-    
-    return x
+    return x.reshape(B, T, H_new, W_new, x.shape[-1])
 
 
 def resample_downsample_3d(
     params: Params,
-    x: Array,
-    cache: CacheList,
-    cache_idx: int,
-) -> Tuple[Array, int, CacheList]:
-    """
-    Downsample3D: resample_conv (spatial) + time_conv (temporal).
-    """
+    x: jnp.ndarray,
+    feat_cache: CacheList = None,
+    feat_idx: int = 0,
+) -> Tuple[jnp.ndarray, int, CacheList]:
+    """PURE_JAX: 原 WanResample.__call__ 的 downsample3d 分支"""
     B, T, H, W, C = x.shape
     x = x.reshape(B * T, H, W, C)
     
-    # Resample conv (2D) with stride 2
+    # PURE_JAX: self.resample_conv(x) → conv2d
     x = conv2d(params['resample_conv'], x, strides=(2, 2), padding=((0, 1), (0, 1)))
     
     H_new, W_new = x.shape[1], x.shape[2]
     x = x.reshape(B, T, H_new, W_new, x.shape[-1])
     
-    # Time convolution
-    if cache[cache_idx] is None:
-        cache[cache_idx] = x
-        cache_idx += 1
-    else:
-        cache_x = x[:, -1:, :, :, :]
-        time_conv_params = params['time_conv']
-        padding_config = (0, 0, 0, 0, 0, 0)  # No padding, stride 2 in time
-        
-        x_concat = jnp.concatenate([cache[cache_idx][:, -1:, :, :, :], x], axis=1)
-        x, _ = conv3d_causal(time_conv_params, x_concat, None, padding_config)
-        
-        cache[cache_idx] = cache_x
-        cache_idx += 1
-    
-    return x, cache_idx, cache
+    if feat_cache is not None:
+        idx = feat_idx
+        if feat_cache[idx] is None:
+            feat_cache[idx] = x
+            feat_idx += 1
+        else:
+            cache_x = x[:, -1:, :, :, :]
+            time_conv_padding = get_causal_padding((3, 1, 1), (2, 1, 1), (0, 0, 0))
+            x = wan_causal_conv3d(
+                params['time_conv'],
+                jnp.concatenate([feat_cache[idx][:, -1:, :, :, :], x], axis=1),
+                None,
+                time_conv_padding,
+            )
+            feat_cache[idx] = cache_x
+            feat_idx += 1
+
+    return x, feat_idx, feat_cache
 
 
-def resample_downsample_2d(
-    params: Params,
-    x: Array,
-) -> Array:
-    """
-    Downsample2D: resample_conv with stride 2.
-    """
+def resample_downsample_2d(params: Params, x: jnp.ndarray) -> jnp.ndarray:
+    """PURE_JAX: 原 WanResample.__call__ 的 downsample2d 分支"""
     B, T, H, W, C = x.shape
     x = x.reshape(B * T, H, W, C)
-    
-    # Resample conv (2D) with stride 2
     x = conv2d(params['resample_conv'], x, strides=(2, 2), padding=((0, 1), (0, 1)))
-    
     H_new, W_new = x.shape[1], x.shape[2]
-    x = x.reshape(B, T, H_new, W_new, x.shape[-1])
-    
-    return x
+    return x.reshape(B, T, H_new, W_new, x.shape[-1])
 
 
 # =============================================================================
-# Residual Block Pure Function
+# WanResidualBlock: nnx.Module → 纯函数
 # =============================================================================
+# PURE_JAX: 原 self.norm1, self.conv1, self.norm2, self.conv2, self.conv_shortcut
+# PURE_JAX: → params['norm1'], params['conv1'], params['norm2'], params['conv2'], params['conv_shortcut']
 
 def residual_block(
     params: Params,
-    x: Array,
-    cache: CacheList,
-    cache_idx: int,
-) -> Tuple[Array, int, CacheList]:
-    """
-    Residual block with two causal convolutions.
-    
-    Args:
-        params: {
-            'norm1': RMS norm params,
-            'conv1': Conv3d params,
-            'norm2': RMS norm params,
-            'conv2': Conv3d params,
-            'conv_shortcut': Conv3d params (optional),
-        }
-        x: Input (B, T, H, W, C)
-        cache: Cache list
-        cache_idx: Current cache index
-    
-    Returns:
-        output, new_cache_idx, updated_cache
-    """
-    # Shortcut
+    x: jnp.ndarray,
+    feat_cache: CacheList = None,
+    feat_idx: int = 0,
+) -> Tuple[jnp.ndarray, int, CacheList]:
+    """PURE_JAX: 原 WanResidualBlock.__call__ 方法"""
+    # Apply shortcut connection
+    # PURE_JAX: self.conv_shortcut(x) → wan_causal_conv3d(params['conv_shortcut'], x, ...)
     if 'conv_shortcut' in params and params['conv_shortcut'] is not None:
-        h, _ = conv3d_causal(params['conv_shortcut'], x, None, (0, 0, 0, 0, 0, 0))
+        shortcut_padding = get_causal_padding(1, 1, 0)
+        h = wan_causal_conv3d(params['conv_shortcut'], x, None, shortcut_padding)
     else:
         h = x
-    
-    # First norm + activation + conv
-    x = rms_norm(params['norm1'], x)
+
+    # First normalization and activation
+    x = rms_norm(params['norm1'], x)  # PURE_JAX: self.norm1(x) → rms_norm(params['norm1'], x)
     x = jax.nn.silu(x)
-    
-    cache_x = x[:, -CACHE_T:, :, :, :]
-    if cache_x.shape[1] < 2 and cache[cache_idx] is not None:
-        cache_x = jnp.concatenate([cache[cache_idx][:, -1:, :, :, :], cache_x], axis=1)
-    
-    padding_config = (1, 1, 1, 1, 2, 0)  # padding=1 for 3x3x3 kernel
-    x, _ = conv3d_causal(params['conv1'], x, cache[cache_idx], padding_config)
-    cache[cache_idx] = cache_x
-    cache_idx += 1
-    
-    # Second norm + activation + conv
+
+    conv_padding = get_causal_padding(3, 1, 1)
+    if feat_cache is not None:
+        idx = feat_idx
+        cache_x = x[:, -CACHE_T:, :, :, :]
+        if cache_x.shape[1] < 2 and feat_cache[idx] is not None:
+            cache_x = jnp.concatenate([feat_cache[idx][:, -1:, :, :, :], cache_x], axis=1)
+
+        # PURE_JAX: self.conv1(x, feat_cache[idx]) → wan_causal_conv3d(params['conv1'], x, feat_cache[idx], ...)
+        x = wan_causal_conv3d(params['conv1'], x, feat_cache[idx], conv_padding)
+        feat_cache[idx] = cache_x
+        feat_idx += 1
+    else:
+        x = wan_causal_conv3d(params['conv1'], x, None, conv_padding)
+
+    # Second normalization and activation
     x = rms_norm(params['norm2'], x)
     x = jax.nn.silu(x)
-    
-    cache_x = x[:, -CACHE_T:, :, :, :]
-    if cache_x.shape[1] < 2 and cache[cache_idx] is not None:
-        cache_x = jnp.concatenate([cache[cache_idx][:, -1:, :, :, :], cache_x], axis=1)
-    
-    x, _ = conv3d_causal(params['conv2'], x, cache[cache_idx], padding_config)
-    cache[cache_idx] = cache_x
-    cache_idx += 1
-    
-    return x + h, cache_idx, cache
+
+    # Dropout (skip in deterministic mode)
+
+    if feat_cache is not None:
+        idx = feat_idx
+        cache_x = x[:, -CACHE_T:, :, :, :]
+        if cache_x.shape[1] < 2 and feat_cache[idx] is not None:
+            cache_x = jnp.concatenate([feat_cache[idx][:, -1:, :, :, :], cache_x], axis=1)
+
+        x = wan_causal_conv3d(params['conv2'], x, feat_cache[idx], conv_padding)
+        feat_cache[idx] = cache_x
+        feat_idx += 1
+    else:
+        x = wan_causal_conv3d(params['conv2'], x, None, conv_padding)
+
+    # Add residual connection
+    return x + h, feat_idx, feat_cache
 
 
 # =============================================================================
-# Attention Block Pure Function
+# WanAttentionBlock: nnx.Module → 纯函数
 # =============================================================================
 
-def attention_block(
-    params: Params,
-    x: Array,
-) -> Array:
-    """
-    Causal self-attention with a single head.
-    
-    Args:
-        params: {
-            'norm': RMS norm params,
-            'to_qkv': Conv2d params (1x1),
-            'proj': Conv2d params (1x1),
-        }
-        x: Input (B, T, H, W, C)
-    
-    Returns:
-        Output (B, T, H, W, C)
-    """
+def attention_block(params: Params, x: jnp.ndarray) -> jnp.ndarray:
+    """PURE_JAX: 原 WanAttentionBlock.__call__ 方法"""
     identity = x
+    # FLAX: x is (B, T, H, W, C)
     B, T, H, W, C = x.shape
-    
+
     x = x.reshape(B * T, H, W, C)
-    x = rms_norm(params['norm'], x)
-    
-    # Compute Q, K, V
+    x = rms_norm(params['norm'], x)  # PURE_JAX: self.norm(x) → rms_norm(params['norm'], x)
+
+    # compute query, key, value
+    # PURE_JAX: self.to_qkv(x) → conv2d(params['to_qkv'], x, ...)
     qkv = conv2d(params['to_qkv'], x, strides=(1, 1), padding="SAME")
     qkv = qkv.reshape(B * T, H * W, 3 * C)
     q, k, v = jnp.split(qkv, 3, axis=-1)
-    
-    # Add head dimension (1 head)
+
+    # add head dimension (1 head)
     q = q[:, None, :, :]
     k = k[:, None, :, :]
     v = v[:, None, :, :]
-    
-    # Scaled dot-product attention
+
+    # apply attention
+    # FLAX: manual scaled dot product attention
     scale = 1.0 / jnp.sqrt(jnp.array(C, dtype=x.dtype))
     attn_weights = jnp.matmul(q, k.swapaxes(-1, -2)) * scale
     attn_weights = jax.nn.softmax(attn_weights, axis=-1)
     x = jnp.matmul(attn_weights, v)
-    
+
     x = x.squeeze(1).reshape(B * T, H, W, C)
-    
-    # Output projection
+
+    # output projection
     x = conv2d(params['proj'], x, strides=(1, 1), padding="SAME")
+
+    # Reshape back
     x = x.reshape(B, T, H, W, C)
-    
+
     return x + identity
 
 
 # =============================================================================
-# Mid Block Pure Function
+# WanMidBlock: nnx.Module → 纯函数
 # =============================================================================
+# PURE_JAX: 原 self.resnets = nnx.List([...]) → params['resnets'] = {0: ..., 1: ...}
+# PURE_JAX: 注意 nnx.List 变为整数键的字典
 
 def mid_block(
     params: Params,
-    x: Array,
-    cache: CacheList,
-    cache_idx: int,
-) -> Tuple[Array, int, CacheList]:
-    """
-    Middle block: resnet -> (attention -> resnet) * num_layers.
-    
-    Args:
-        params: {
-            'resnets': dict with integer keys (0, 1, ...) for residual block params,
-            'attentions': dict with integer keys for attention block params,
-        }
-    """
+    x: jnp.ndarray,
+    feat_cache: CacheList = None,
+    feat_idx: int = 0,
+) -> Tuple[jnp.ndarray, int, CacheList]:
+    """PURE_JAX: 原 WanMidBlock.__call__ 方法"""
     resnets = params['resnets']
     attentions = params['attentions']
     
-    # Get number of resnets (handle both dict with int keys and list)
-    if isinstance(resnets, dict):
-        resnet_keys = sorted([k for k in resnets.keys() if isinstance(k, int)])
-        num_resnets = len(resnet_keys)
-    else:
-        num_resnets = len(resnets)
-        resnet_keys = list(range(num_resnets))
+    # PURE_JAX: 遍历字典需要按键排序
+    resnet_keys = sorted([k for k in resnets.keys() if isinstance(k, int)])
+    attn_keys = sorted([k for k in attentions.keys() if isinstance(k, int)])
     
-    if isinstance(attentions, dict):
-        attn_keys = sorted([k for k in attentions.keys() if isinstance(k, int)])
-    else:
-        attn_keys = list(range(len(attentions)))
-    
-    # First resnet
-    x, cache_idx, cache = residual_block(resnets[resnet_keys[0]], x, cache, cache_idx)
-    
-    # Attention + resnet pairs
+    # First residual block
+    x, feat_idx, feat_cache = residual_block(resnets[resnet_keys[0]], x, feat_cache, feat_idx)
+
+    # Process through attention and residual blocks
+    # PURE_JAX: 原 for attn, resnet in zip(self.attentions, self.resnets[1:])
     for i, attn_key in enumerate(attn_keys):
         resnet_key = resnet_keys[i + 1]
-        attn_params = attentions[attn_key]
-        resnet_params = resnets[resnet_key]
-        
-        if attn_params is not None:
-            x = attention_block(attn_params, x)
-        x, cache_idx, cache = residual_block(resnet_params, x, cache, cache_idx)
-    
-    return x, cache_idx, cache
+        if attentions[attn_key] is not None:
+            x = attention_block(attentions[attn_key], x)
+        x, feat_idx, feat_cache = residual_block(resnets[resnet_key], x, feat_cache, feat_idx)
+
+    return x, feat_idx, feat_cache
 
 
 # =============================================================================
-# Encoder Pure Functions
+# WanUpBlock: nnx.Module → 纯函数
 # =============================================================================
 
-def encoder_down_block_residual(
+def up_block(
     params: Params,
-    x: Array,
-    cache: CacheList,
-    cache_idx: int,
-    config: Dict,
-) -> Tuple[Array, int, CacheList]:
-    """
-    Residual downsampling block for encoder.
-    """
-    x_copy = x
+    x: jnp.ndarray,
+    out_dim: int,
+    upsample_mode: Optional[str] = None,
+    feat_cache: CacheList = None,
+    feat_idx: int = 0,
+) -> Tuple[jnp.ndarray, int, CacheList]:
+    """PURE_JAX: 原 WanUpBlock.__call__ 方法"""
+    resnets = params['resnets']
+    resnet_keys = sorted([k for k in resnets.keys() if isinstance(k, int)])
     
-    # Residual blocks
-    for resnet_params in iter_dict_values(params['resnets']):
-        x, cache_idx, cache = residual_block(resnet_params, x, cache, cache_idx)
-    
-    # Downsample if needed
-    if 'downsampler' in params and params['downsampler'] is not None:
-        mode = config['mode']
-        if mode == 'downsample3d':
-            x, cache_idx, cache = resample_downsample_3d(
-                params['downsampler'], x, cache, cache_idx
-            )
-        else:  # downsample2d
-            x = resample_downsample_2d(params['downsampler'], x)
-    
-    # Shortcut with average pooling
-    x_short = avg_down_3d(
-        x_copy,
-        config['in_dim'],
-        config['out_dim'],
-        config['factor_t'],
-        config['factor_s'],
-    )
-    
-    return x + x_short, cache_idx, cache
+    # PURE_JAX: 原 for resnet in self.resnets
+    for key in resnet_keys:
+        x, feat_idx, feat_cache = residual_block(resnets[key], x, feat_cache, feat_idx)
 
-
-def encoder_forward(
-    params: Params,
-    x: Array,
-    cache: CacheList,
-    config: Dict,
-) -> Tuple[Array, int, CacheList]:
-    """
-    Encoder forward pass.
-    
-    Args:
-        params: Encoder parameters
-        x: Input (B, T, H, W, C)
-        cache: Feature cache list
-        config: Encoder configuration
-    
-    Returns:
-        output, cache_idx, updated_cache
-    """
-    cache_idx = 0
-    
-    # Conv in
-    cache_x = x[:, -CACHE_T:, :, :, :]
-    if cache_x.shape[1] < 2 and cache[cache_idx] is not None:
-        cache_x = jnp.concatenate([cache[cache_idx][:, -1:, :, :, :], cache_x], axis=1)
-    
-    padding_config = (1, 1, 1, 1, 2, 0)
-    x, _ = conv3d_causal(params['conv_in'], x, cache[cache_idx], padding_config)
-    cache[cache_idx] = cache_x
-    cache_idx += 1
-    
-    # Down blocks
-    down_blocks = params['down_blocks']
-    if isinstance(down_blocks, dict):
-        down_block_keys = sorted([k for k in down_blocks.keys() if isinstance(k, int)])
-    else:
-        down_block_keys = list(range(len(down_blocks)))
-    
-    for i, key in enumerate(down_block_keys):
-        down_block_params = down_blocks[key]
-        block_config = config['down_blocks'][i]
-        if block_config['type'] == 'residual':
-            x, cache_idx, cache = encoder_down_block_residual(
-                down_block_params, x, cache, cache_idx, block_config
+    # PURE_JAX: 原 if len(self.upsamplers) > 0
+    if 'upsamplers' in params and 0 in params['upsamplers']:
+        upsampler_params = params['upsamplers'][0]
+        if upsample_mode == "upsample3d":
+            x, feat_idx, feat_cache = resample_upsample_3d(
+                upsampler_params, x, out_dim, feat_cache, feat_idx
             )
-        else:
-            # Non-residual blocks (residual blocks + optional attention + resample)
-            layers = down_block_params['layers']
-            if isinstance(layers, dict):
-                layer_keys = sorted([k for k in layers.keys() if isinstance(k, int)])
-            else:
-                layer_keys = list(range(len(layers)))
-            
-            for j, layer_key in enumerate(layer_keys):
-                layer_params = layers[layer_key]
-                layer_type = block_config['layers'][j]['type']
-                if layer_type == 'residual':
-                    x, cache_idx, cache = residual_block(layer_params, x, cache, cache_idx)
-                elif layer_type == 'attention':
-                    x = attention_block(layer_params, x)
-                elif layer_type == 'downsample3d':
-                    x, cache_idx, cache = resample_downsample_3d(layer_params, x, cache, cache_idx)
-                elif layer_type == 'downsample2d':
-                    x = resample_downsample_2d(layer_params, x)
+        elif upsample_mode == "upsample2d":
+            x = resample_upsample_2d(upsampler_params, x)
     
-    # Mid block
-    x, cache_idx, cache = mid_block(params['mid_block'], x, cache, cache_idx)
-    
-    # Output
-    x = rms_norm(params['norm_out'], x)
-    x = jax.nn.silu(x)
-    
-    cache_x = x[:, -CACHE_T:, :, :, :]
-    if cache_x.shape[1] < 2 and cache[cache_idx] is not None:
-        cache_x = jnp.concatenate([cache[cache_idx][:, -1:, :, :, :], cache_x], axis=1)
-    
-    x, _ = conv3d_causal(params['conv_out'], x, cache[cache_idx], padding_config)
-    cache[cache_idx] = cache_x
-    cache_idx += 1
-    
-    return x, cache_idx, cache
+    return x, feat_idx, feat_cache
 
 
 # =============================================================================
-# Decoder Pure Functions
+# WanDecoder3d: nnx.Module → 纯函数
 # =============================================================================
-
-def iter_dict_values(d):
-    """Iterate over dict values in sorted key order (for int keys)."""
-    if isinstance(d, dict):
-        keys = sorted([k for k in d.keys() if isinstance(k, int)])
-        for k in keys:
-            yield d[k]
-    else:
-        for v in d:
-            yield v
-
-
-def decoder_up_block_residual(
-    params: Params,
-    x: Array,
-    cache: CacheList,
-    cache_idx: int,
-    config: Dict,
-    first_chunk: bool,
-) -> Tuple[Array, int, CacheList]:
-    """
-    Residual upsampling block for decoder.
-    """
-    x_copy = x
-    
-    # Residual blocks
-    for resnet_params in iter_dict_values(params['resnets']):
-        x, cache_idx, cache = residual_block(resnet_params, x, cache, cache_idx)
-    
-    # Upsample if needed
-    if 'upsampler' in params and params['upsampler'] is not None:
-        mode = config['mode']
-        if mode == 'upsample3d':
-            x, cache_idx, cache = resample_upsample_3d(
-                params['upsampler'], x, cache, cache_idx, config['dim']
-            )
-        else:  # upsample2d
-            x = resample_upsample_2d(params['upsampler'], x)
-    
-    # Shortcut with duplication upsampling
-    if config.get('up_flag', False):
-        x_short = dup_up_3d(
-            x_copy,
-            config['in_dim'],
-            config['out_dim'],
-            config['factor_t'],
-            config['factor_s'],
-            first_chunk=first_chunk,
-        )
-        return x + x_short, cache_idx, cache
-    
-    return x, cache_idx, cache
-
-
-def decoder_up_block(
-    params: Params,
-    x: Array,
-    cache: CacheList,
-    cache_idx: int,
-    config: Dict,
-) -> Tuple[Array, int, CacheList]:
-    """
-    Standard upsampling block for decoder.
-    """
-    # Residual blocks
-    for resnet_params in iter_dict_values(params['resnets']):
-        x, cache_idx, cache = residual_block(resnet_params, x, cache, cache_idx)
-    
-    # Upsample if needed
-    if 'upsamplers' in params and len(params['upsamplers']) > 0:
-        mode = config['mode']
-        if mode == 'upsample3d':
-            x, cache_idx, cache = resample_upsample_3d(
-                params['upsamplers'][0], x, cache, cache_idx, config['dim']
-            )
-        elif mode == 'upsample2d':
-            x = resample_upsample_2d(params['upsamplers'][0], x)
-    
-    return x, cache_idx, cache
-
+# PURE_JAX: 这是最关键的改造 - 整个 Decoder 类变成一个函数
 
 def decoder_forward(
     params: Params,
-    x: Array,
-    cache: CacheList,
-    config: Dict,
+    x: jnp.ndarray,
+    config: "AutoencoderKLWanConfig",
+    feat_cache: CacheList = None,
     first_chunk: bool = False,
-) -> Tuple[Array, int, CacheList]:
+) -> Tuple[jnp.ndarray, int, CacheList]:
     """
-    Decoder forward pass for a single frame or chunk.
+    PURE_JAX: 原 WanDecoder3d.__call__ 方法
     
-    Args:
-        params: Decoder parameters
-        x: Input latent (B, 1, H, W, C) - single frame
-        cache: Feature cache list
-        config: Decoder configuration
-        first_chunk: Whether this is the first chunk
-    
-    Returns:
-        output, cache_idx, updated_cache
+    params: {
+        'conv_in': {...},
+        'mid_block': {...},
+        'up_blocks': {0: {...}, 1: {...}, ...},
+        'norm_out': {...},
+        'conv_out': {...},
+    }
     """
-    cache_idx = 0
+    feat_idx = 0
+    conv_padding = get_causal_padding(3, 1, 1)
     
-    # Conv in
-    cache_x = x[:, -CACHE_T:, :, :, :]
-    if cache_x.shape[1] < 2 and cache[cache_idx] is not None:
-        cache_x = jnp.concatenate([cache[cache_idx][:, -1:, :, :, :], cache_x], axis=1)
-    
-    padding_config = (1, 1, 1, 1, 2, 0)
-    x, _ = conv3d_causal(params['conv_in'], x, cache[cache_idx], padding_config)
-    cache[cache_idx] = cache_x
-    cache_idx += 1
-    
-    # Mid block
-    x, cache_idx, cache = mid_block(params['mid_block'], x, cache, cache_idx)
-    
-    # Up blocks
-    up_blocks = params['up_blocks']
-    if isinstance(up_blocks, dict):
-        up_block_keys = sorted([k for k in up_blocks.keys() if isinstance(k, int)])
+    ## conv_in
+    if feat_cache is not None:
+        idx = feat_idx
+        cache_x = x[:, -CACHE_T:, :, :, :]
+        if cache_x.shape[1] < 2 and feat_cache[idx] is not None:
+            cache_x = jnp.concatenate([feat_cache[idx][:, -1:, :, :, :], cache_x], axis=1)
+        # PURE_JAX: self.conv_in(x, feat_cache[idx]) → wan_causal_conv3d(params['conv_in'], x, ...)
+        x = wan_causal_conv3d(params['conv_in'], x, feat_cache[idx], conv_padding)
+        feat_cache[idx] = cache_x
+        feat_idx += 1
     else:
-        up_block_keys = list(range(len(up_blocks)))
+        x = wan_causal_conv3d(params['conv_in'], x, None, conv_padding)
+
+    ## middle
+    x, feat_idx, feat_cache = mid_block(params['mid_block'], x, feat_cache, feat_idx)
+
+    ## upsamples
+    # PURE_JAX: 原 for up_block in self.up_blocks
+    up_blocks = params['up_blocks']
+    up_block_keys = sorted([k for k in up_blocks.keys() if isinstance(k, int)])
+    
+    # 计算 upsample mode (与 WanDecoder3d.__init__ 逻辑一致)
+    dim_mult = list(config.dim_mult)
+    temperal_upsample = list(reversed(config.temperal_downsample))
+    decoder_base_dim = config.decoder_base_dim or config.base_dim
+    dims = [decoder_base_dim * u for u in [dim_mult[-1]] + dim_mult[::-1]]
     
     for i, key in enumerate(up_block_keys):
-        up_block_params = up_blocks[key]
-        block_config = config['up_blocks'][i]
-        if block_config['type'] == 'residual':
-            x, cache_idx, cache = decoder_up_block_residual(
-                up_block_params, x, cache, cache_idx, block_config, first_chunk
-            )
+        up_flag = i != len(dim_mult) - 1
+        temp_up = temperal_upsample[i] if up_flag else False
+        upsample_mode = None
+        if up_flag:
+            upsample_mode = "upsample3d" if temp_up else "upsample2d"
+        
+        # 计算 out_dim
+        if i > 0 and not config.is_residual:
+            in_dim = dims[i] // 2
         else:
-            x, cache_idx, cache = decoder_up_block(
-                up_block_params, x, cache, cache_idx, block_config
-            )
-    
-    # Output
+            in_dim = dims[i]
+        out_dim = dims[i + 1]
+        
+        x, feat_idx, feat_cache = up_block(
+            up_blocks[key], x, out_dim, upsample_mode, feat_cache, feat_idx
+        )
+
+    ## head
     x = rms_norm(params['norm_out'], x)
     x = jax.nn.silu(x)
-    
-    cache_x = x[:, -CACHE_T:, :, :, :]
-    if cache_x.shape[1] < 2 and cache[cache_idx] is not None:
-        cache_x = jnp.concatenate([cache[cache_idx][:, -1:, :, :, :], cache_x], axis=1)
-    
-    x, _ = conv3d_causal(params['conv_out'], x, cache[cache_idx], padding_config)
-    cache[cache_idx] = cache_x
-    cache_idx += 1
-    
-    # Replicate to all devices
+    if feat_cache is not None:
+        idx = feat_idx
+        cache_x = x[:, -CACHE_T:, :, :, :]
+        if cache_x.shape[1] < 2 and feat_cache[idx] is not None:
+            cache_x = jnp.concatenate([feat_cache[idx][:, -1:, :, :, :], cache_x], axis=1)
+        x = wan_causal_conv3d(params['conv_out'], x, feat_cache[idx], conv_padding)
+        feat_cache[idx] = cache_x
+        feat_idx += 1
+    else:
+        x = wan_causal_conv3d(params['conv_out'], x, None, conv_padding)
+
+    # Replicate back to every devices
     x = mark_sharding(x, P())
-    
-    return x, cache_idx, cache
+    return x, feat_idx, feat_cache
 
 
 # =============================================================================
-# Configuration
+# patchify / unpatchify: 保持不变（原本就是纯函数）
+# =============================================================================
+
+def patchify(x, patch_size):
+    if patch_size == 1:
+        return x
+
+    if x.ndim != 5:
+        raise ValueError(f"Invalid input shape: {x.shape}")
+    # FLAX: x shape: [B, T, H, W, C] instead of [B, C, T, H, W]
+    B, T, H, W, C = x.shape
+
+    if H % patch_size != 0 or W % patch_size != 0:
+        raise ValueError(f"Height ({H}) and width ({W}) must be divisible by patch_size ({patch_size})")
+
+    x = x.reshape(B, T, H // patch_size, patch_size, W // patch_size, patch_size, C)
+    x = x.transpose(0, 1, 2, 4, 3, 5, 6)
+    x = x.reshape(B, T, H // patch_size, W // patch_size, C * patch_size * patch_size)
+
+    return x
+
+
+def unpatchify(x, patch_size):
+    if patch_size == 1:
+        return x
+
+    if x.ndim != 5:
+        raise ValueError(f"Invalid input shape: {x.shape}")
+    # FLAX: x shape: (B, T, H, W, C_patches)
+    B, T, H, W, C_patches = x.shape
+    C = C_patches // (patch_size * patch_size)
+
+    x = x.reshape(B, T, H, W, patch_size, patch_size, C)
+    x = x.transpose(0, 1, 2, 4, 3, 5, 6)
+    x = x.reshape(B, T, H * patch_size, W * patch_size, C)
+
+    return x
+
+
+# =============================================================================
+# AutoencoderKLWanConfig: 保持不变
 # =============================================================================
 
 @dataclass
 class AutoencoderKLWanConfig:
-    """Configuration class for AutoencoderKLWan (Pure JAX version)."""
+    """
+    Configuration class for AutoencoderKLWan.
+    PURE_JAX: 配置类保持不变
+    """
     config_name: str = "config.json"
-    
+
     base_dim: int = 96
     decoder_base_dim: Optional[int] = None
     z_dim: int = 16
@@ -885,12 +713,13 @@ class AutoencoderKLWanConfig:
     patch_size: Optional[int] = None
     scale_factor_temporal: Optional[int] = 4
     scale_factor_spatial: Optional[int] = 8
-    
+
     @classmethod
     def from_dict(cls, config_dict: Dict):
         import dataclasses
         field_names = {f.name for f in dataclasses.fields(cls)}
         filtered_dict = {k: v for k, v in config_dict.items() if k in field_names}
+        # Handle list/tuple conversion
         for key in ["dim_mult", "attn_scales", "temperal_downsample", "latents_mean", "latents_std"]:
             if key in filtered_dict:
                 filtered_dict[key] = tuple(filtered_dict[key])
@@ -898,549 +727,99 @@ class AutoencoderKLWanConfig:
 
 
 # =============================================================================
-# Patchify / Unpatchify
+# AutoencoderKLWan: nnx.Module → 普通类 + 纯函数
 # =============================================================================
-
-def patchify(x: Array, patch_size: int) -> Array:
-    """Convert image to patches."""
-    if patch_size == 1:
-        return x
-    
-    B, T, H, W, C = x.shape
-    if H % patch_size != 0 or W % patch_size != 0:
-        raise ValueError(f"Height ({H}) and width ({W}) must be divisible by patch_size ({patch_size})")
-    
-    x = x.reshape(B, T, H // patch_size, patch_size, W // patch_size, patch_size, C)
-    x = x.transpose(0, 1, 2, 4, 3, 5, 6)
-    x = x.reshape(B, T, H // patch_size, W // patch_size, C * patch_size * patch_size)
-    return x
-
-
-def unpatchify(x: Array, patch_size: int) -> Array:
-    """Convert patches back to image."""
-    if patch_size == 1:
-        return x
-    
-    B, T, H, W, C_patches = x.shape
-    C = C_patches // (patch_size * patch_size)
-    
-    x = x.reshape(B, T, H, W, patch_size, patch_size, C)
-    x = x.transpose(0, 1, 2, 4, 3, 5, 6)
-    x = x.reshape(B, T, H * patch_size, W * patch_size, C)
-    return x
-
-
-# =============================================================================
-# Main VAE Functions
-# =============================================================================
-
-def count_decoder_convs(config: AutoencoderKLWanConfig) -> int:
-    """Count the number of causal conv3d layers in decoder."""
-    count = 1  # conv_in
-    
-    # Mid block: 1 + num_layers resnets, each resnet has 2 convs
-    count += (1 + 1) * 2  # 2 resnets for num_layers=1
-    
-    # Up blocks
-    dim_mult = list(config.dim_mult)
-    num_res_blocks = config.num_res_blocks
-    temperal_upsample = list(reversed(config.temperal_downsample))
-    
-    for i in range(len(dim_mult)):
-        # Each up block has (num_res_blocks + 1) resnets
-        count += (num_res_blocks + 1) * 2
-        
-        # Upsample has time_conv (1 conv) if 3d
-        up_flag = i != len(dim_mult) - 1
-        if up_flag and temperal_upsample[i]:
-            count += 1  # time_conv in upsample3d
-    
-    count += 1  # conv_out
-    
-    return count
-
-
-def count_encoder_convs(config: AutoencoderKLWanConfig) -> int:
-    """Count the number of causal conv3d layers in encoder."""
-    count = 1  # conv_in
-    
-    dim_mult = list(config.dim_mult)
-    num_res_blocks = config.num_res_blocks
-    temperal_downsample = list(config.temperal_downsample)
-    
-    for i in range(len(dim_mult)):
-        if config.is_residual:
-            # Residual down block has num_res_blocks resnets
-            count += num_res_blocks * 2
-            # Downsample has time_conv if 3d
-            if i != len(dim_mult) - 1 and temperal_downsample[i]:
-                count += 1
-        else:
-            # Non-residual: num_res_blocks resnets
-            count += num_res_blocks * 2
-            # Downsample
-            if i != len(dim_mult) - 1 and temperal_downsample[i]:
-                count += 1
-    
-    # Mid block
-    count += (1 + 1) * 2
-    
-    count += 1  # conv_out
-    
-    return count
-
-
-def init_cache(num_convs: int) -> CacheList:
-    """Initialize cache list with None values."""
-    return [None] * num_convs
-
-
-def vae_encode(
-    params: Params,
-    x: Array,
-    config: AutoencoderKLWanConfig,
-) -> Tuple[Array, Array]:
-    """
-    Encode input to latent space.
-    
-    Args:
-        params: VAE parameters
-        x: Input video (B, T, H, W, C) in NTHWC format
-        config: VAE configuration
-    
-    Returns:
-        mean, logvar of latent distribution
-    """
-    B, T, H, W, C = x.shape
-    
-    num_enc_convs = count_encoder_convs(config)
-    cache = init_cache(num_enc_convs)
-    
-    if config.patch_size is not None:
-        x = patchify(x, config.patch_size)
-    
-    # Build encoder config
-    enc_config = build_encoder_config(config)
-    
-    # Frame-by-frame encoding
-    iter_ = 1 + (T - 1) // 4
-    out = None
-    
-    for i in range(iter_):
-        if i == 0:
-            out, _, cache = encoder_forward(
-                params['encoder'], x[:, :1, :, :, :], cache, enc_config
-            )
-        else:
-            start_idx = 1 + 4 * (i - 1)
-            end_idx = 1 + 4 * i
-            out_, _, cache = encoder_forward(
-                params['encoder'], x[:, start_idx:end_idx, :, :, :], cache, enc_config
-            )
-            out = jnp.concatenate([out, out_], axis=1)
-    
-    # Quant conv
-    enc = conv3d(params['quant_conv'], out, padding="SAME")
-    
-    # Split to mean and logvar
-    mean, logvar = jnp.split(enc, 2, axis=-1)
-    
-    return mean, logvar
-
-
-def vae_decode(
-    params: Params,
-    z: Array,
-    config: AutoencoderKLWanConfig,
-) -> Array:
-    """
-    Decode latent to video.
-    
-    Args:
-        params: VAE parameters
-        z: Latent tensor (B, T, H, W, C) in NTHWC format
-        config: VAE configuration
-    
-    Returns:
-        Decoded video (B, T_out, H_out, W_out, C_out)
-    """
-    B, T, H, W, C = z.shape
-    
-    num_dec_convs = count_decoder_convs(config)
-    cache = init_cache(num_dec_convs)
-    
-    # Post quant conv
-    x = conv3d(params['post_quant_conv'], z, padding="SAME")
-    
-    # Build decoder config
-    dec_config = build_decoder_config(config)
-    
-    # Frame-by-frame decoding
-    out = None
-    for i in range(T):
-        if i == 0:
-            out, _, cache = decoder_forward(
-                params['decoder'],
-                x[:, i:i+1, :, :, :],
-                cache,
-                dec_config,
-                first_chunk=True,
-            )
-        else:
-            out_, _, cache = decoder_forward(
-                params['decoder'],
-                x[:, i:i+1, :, :, :],
-                cache,
-                dec_config,
-                first_chunk=False,
-            )
-            out = jnp.concatenate([out, out_], axis=1)
-    
-    # Unpatchify if needed
-    if config.patch_size is not None:
-        out = unpatchify(out, config.patch_size)
-    
-    return jnp.clip(out, -1.0, 1.0)
-
-
-# =============================================================================
-# Configuration Builders
-# =============================================================================
-
-def build_encoder_config(config: AutoencoderKLWanConfig) -> Dict:
-    """Build encoder block configuration."""
-    dim_mult = list(config.dim_mult)
-    dims = [config.base_dim * u for u in [1] + dim_mult]
-    temperal_downsample = list(config.temperal_downsample)
-    
-    down_blocks = []
-    for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:])):
-        down_flag = i != len(dim_mult) - 1
-        temp_down = temperal_downsample[i] if down_flag else False
-        
-        if config.is_residual:
-            down_blocks.append({
-                'type': 'residual',
-                'in_dim': in_dim,
-                'out_dim': out_dim,
-                'factor_t': 2 if temp_down else 1,
-                'factor_s': 2 if down_flag else 1,
-                'mode': 'downsample3d' if temp_down else ('downsample2d' if down_flag else None),
-            })
-        else:
-            layers = []
-            for _ in range(config.num_res_blocks):
-                layers.append({'type': 'residual', 'in_dim': in_dim, 'out_dim': out_dim})
-                in_dim = out_dim
-            if down_flag:
-                mode = 'downsample3d' if temp_down else 'downsample2d'
-                layers.append({'type': mode})
-            down_blocks.append({'type': 'standard', 'layers': layers})
-    
-    return {'down_blocks': down_blocks}
-
-
-def build_decoder_config(config: AutoencoderKLWanConfig) -> Dict:
-    """Build decoder block configuration."""
-    decoder_base_dim = config.decoder_base_dim or config.base_dim
-    dim_mult = list(config.dim_mult)
-    dims = [decoder_base_dim * u for u in [dim_mult[-1]] + dim_mult[::-1]]
-    temperal_upsample = list(reversed(config.temperal_downsample))
-    
-    up_blocks = []
-    for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:])):
-        if i > 0 and not config.is_residual:
-            in_dim = in_dim // 2
-        
-        up_flag = i != len(dim_mult) - 1
-        temp_up = temperal_upsample[i] if up_flag else False
-        
-        if config.is_residual:
-            up_blocks.append({
-                'type': 'residual',
-                'in_dim': in_dim,
-                'out_dim': out_dim,
-                'factor_t': 2 if temp_up else 1,
-                'factor_s': 2 if up_flag else 1,
-                'up_flag': up_flag,
-                'dim': out_dim,
-                'mode': 'upsample3d' if temp_up else ('upsample2d' if up_flag else None),
-            })
-        else:
-            mode = None
-            if up_flag:
-                mode = 'upsample3d' if temp_up else 'upsample2d'
-            up_blocks.append({
-                'type': 'standard',
-                'dim': out_dim,
-                'mode': mode,
-            })
-    
-    return {'up_blocks': up_blocks}
-
-
-# =============================================================================
-# Weight Loading
-# =============================================================================
-
-def load_vae_params(
-    pretrained_model_name_or_path: str,
-    subfolder: Optional[str] = "vae",
-    dtype: jnp.dtype = jnp.float32,
-) -> Tuple[Params, AutoencoderKLWanConfig]:
-    """
-    Load VAE parameters from pretrained checkpoint.
-    
-    Args:
-        pretrained_model_name_or_path: HuggingFace model ID or local path
-        subfolder: Subfolder containing VAE files
-        dtype: Target dtype for parameters
-    
-    Returns:
-        params: Nested dict of parameters
-        config: VAE configuration
-    """
-    from huggingface_hub import hf_hub_download
-    from safetensors import safe_open
-    import json
-    import re
-    
-    # 1. Load config
-    config_path = hf_hub_download(
-        pretrained_model_name_or_path,
-        subfolder=subfolder,
-        filename="config.json"
-    )
-    with open(config_path, 'r') as f:
-        config_dict = json.load(f)
-    config = AutoencoderKLWanConfig.from_dict(config_dict)
-    
-    # 2. Load weights
-    ckpt_path = hf_hub_download(
-        pretrained_model_name_or_path,
-        subfolder=subfolder,
-        filename="diffusion_pytorch_model.safetensors"
-    )
-    
-    pytorch_weights = {}
-    with safe_open(ckpt_path, framework="np") as f:
-        for k in f.keys():
-            pytorch_weights[k] = f.get_tensor(k)
-    
-    # 3. Convert PyTorch weights to JAX format
-    params = convert_pytorch_to_jax_params(pytorch_weights, config, dtype)
-    
-    return params, config
-
-
-def convert_pytorch_to_jax_params(
-    pytorch_weights: Dict[str, Any],
-    config: AutoencoderKLWanConfig,
-    dtype: jnp.dtype,
-) -> Params:
-    """
-    Convert PyTorch weight dict to JAX parameter pytree.
-    
-    Handles:
-    - Weight key renaming (following Flax NNX conventions)
-    - Tensor transposition for different conventions
-    - Dtype conversion
-    """
-    import re
-    from collections import defaultdict
-    
-    def make_nested_dict():
-        return defaultdict(make_nested_dict)
-    
-    params = make_nested_dict()
-    
-    def set_nested(d, keys, value):
-        for key in keys[:-1]:
-            d = d[key]
-        d[keys[-1]] = value
-    
-    def rename_key(key: str) -> str:
-        """
-        Rename PyTorch key to JAX conventions.
-        Based on Flax NNX version's rename_key function.
-        """
-        # CausalConv3d internal conv
-        key = key.replace("conv_in.bias", "conv_in.bias")
-        key = key.replace("conv_in.weight", "conv_in.kernel")
-        key = key.replace("conv_out.bias", "conv_out.bias")
-        key = key.replace("conv_out.weight", "conv_out.kernel")
-        
-        # Numbered conv layers (conv1, conv2, etc.)
-        key = re.sub(r"conv(\d+)\.weight", r"conv\1.kernel", key)
-        key = re.sub(r"conv(\d+)\.bias", r"conv\1.bias", key)
-        
-        # Time conv
-        key = key.replace("time_conv.weight", "time_conv.kernel")
-        key = key.replace("time_conv.bias", "time_conv.bias")
-        
-        # Quant conv
-        key = key.replace("quant_conv.weight", "quant_conv.kernel")
-        key = key.replace("quant_conv.bias", "quant_conv.bias")
-        key = key.replace("post_quant_conv.weight", "post_quant_conv.kernel")
-        key = key.replace("post_quant_conv.bias", "post_quant_conv.bias")
-        
-        # Conv shortcut
-        key = key.replace("conv_shortcut.weight", "conv_shortcut.kernel")
-        key = key.replace("conv_shortcut.bias", "conv_shortcut.bias")
-        
-        # Resample layers - IMPORTANT: resample.1 -> resample_conv
-        key = key.replace("resample.1.weight", "resample_conv.kernel")
-        key = key.replace("resample.1.bias", "resample_conv.bias")
-        
-        # Attention layers
-        key = key.replace("to_qkv.weight", "to_qkv.kernel")
-        key = key.replace("to_qkv.bias", "to_qkv.bias")
-        key = key.replace("proj.weight", "proj.kernel")
-        key = key.replace("proj.bias", "proj.bias")
-        
-        # Norm layers: weight -> gamma
-        key = key.replace(".weight", ".gamma")
-        
-        return key
-    
-    def convert_key(key: str) -> List[str]:
-        """Convert renamed key to list of nested keys."""
-        # Replace module indices with list indices
-        key = re.sub(r'\.(\d+)\.', r'[\1].', key)
-        key = re.sub(r'\.(\d+)$', r'[\1]', key)
-        
-        # Split by dots
-        parts = []
-        current = ""
-        for char in key:
-            if char == '.':
-                if current:
-                    parts.append(current)
-                    current = ""
-            elif char == '[':
-                if current:
-                    parts.append(current)
-                    current = ""
-                current = "["
-            elif char == ']':
-                current += char
-                parts.append(current)
-                current = ""
-            else:
-                current += char
-        if current:
-            parts.append(current)
-        
-        # Convert to proper keys
-        result = []
-        for part in parts:
-            if part.startswith('[') and part.endswith(']'):
-                result.append(int(part[1:-1]))
-            else:
-                result.append(part)
-        
-        return result
-    
-    for pt_key, pt_tensor in pytorch_weights.items():
-        # First apply key renaming
-        jax_key = rename_key(pt_key)
-        
-        # Convert tensor shape
-        tensor = pt_tensor
-        if 'kernel' in jax_key:
-            if tensor.ndim == 5:
-                # Conv3d: (Out, In, T, H, W) -> (T, H, W, In, Out)
-                tensor = tensor.transpose(2, 3, 4, 1, 0)
-            elif tensor.ndim == 4:
-                # Conv2d: (Out, In, H, W) -> (H, W, In, Out)
-                tensor = tensor.transpose(2, 3, 1, 0)
-        
-        if 'gamma' in jax_key:
-            tensor = tensor.squeeze()
-        
-        # Convert to JAX array
-        tensor = jnp.array(tensor, dtype=dtype)
-        
-        # Set in nested dict
-        keys = convert_key(jax_key)
-        set_nested(params, keys, tensor)
-    
-    # Convert defaultdict to regular dict
-    def to_regular_dict(d):
-        if isinstance(d, defaultdict):
-            d = {k: to_regular_dict(v) for k, v in d.items()}
-        return d
-    
-    return to_regular_dict(params)
-
-
-# =============================================================================
-# JIT-Compiled Decode Function
-# =============================================================================
-
-@functools.partial(jax.jit, static_argnums=(2,))
-def decode_jit(
-    params: Params,
-    z: Array,
-    config_hash: int,  # Use hash for static arg (config is not hashable)
-    config_dict: Dict,  # Pass config as dict
-) -> Array:
-    """
-    JIT-compiled decode function.
-    
-    Note: config is passed as both a hash (for cache key) and dict (for values).
-    """
-    config = AutoencoderKLWanConfig.from_dict(config_dict)
-    return vae_decode(params, z, config)
-
-
-# =============================================================================
-# High-Level API (compatible with original interface)
-# =============================================================================
+# PURE_JAX: 原 class AutoencoderKLWan(nnx.Module, pytree=False)
+# PURE_JAX: 改为普通类，不继承 nnx.Module，无需 pytree=False hack
 
 class AutoencoderKLWan:
     """
-    Pure JAX VAE with an object-oriented interface for compatibility.
+    PURE_JAX: 原 AutoencoderKLWan(nnx.Module, pytree=False) 改为普通类
     
-    Unlike the NNX version, this is just a thin wrapper around pure functions.
-    All actual computation uses the pure functions above.
+    主要改动：
+    1. 不继承 nnx.Module
+    2. self.encoder, self.decoder 等 → self.params['encoder'], self.params['decoder']
+    3. self._feat_map 可变状态 → 显式传递的 cache
+    4. 无需 pytree=False，因为不再是 nnx.Module
     """
-    
+
+    config_class = AutoencoderKLWanConfig
+
     def __init__(self, params: Params, config: AutoencoderKLWanConfig):
+        """
+        PURE_JAX: 原 __init__ 创建子模块，现在直接接收 params
+        """
         self.params = params
         self.config = config
-        self._config_dict = {
-            'base_dim': config.base_dim,
-            'decoder_base_dim': config.decoder_base_dim,
-            'z_dim': config.z_dim,
-            'dim_mult': list(config.dim_mult),
-            'num_res_blocks': config.num_res_blocks,
-            'attn_scales': list(config.attn_scales),
-            'temperal_downsample': list(config.temperal_downsample),
-            'dropout': config.dropout,
-            'latents_mean': list(config.latents_mean),
-            'latents_std': list(config.latents_std),
-            'is_residual': config.is_residual,
-            'in_channels': config.in_channels,
-            'out_channels': config.out_channels,
-            'patch_size': config.patch_size,
-            'scale_factor_temporal': config.scale_factor_temporal,
-            'scale_factor_spatial': config.scale_factor_spatial,
-        }
-        self._config_hash = hash(tuple(sorted(self._config_dict.items())))
-    
-    def encode(self, x: Array) -> Tuple[Array, Array]:
-        """Encode input to latent distribution."""
-        return vae_encode(self.params, x, self.config)
-    
-    def decode(self, z: Array) -> Array:
-        """Decode latent to output."""
-        return vae_decode(self.params, z, self.config)
-    
-    def decode_jit(self, z: Array) -> Array:
-        """JIT-compiled decode."""
-        return decode_jit(self.params, z, self._config_hash, self._config_dict)
-    
+
+    def _count_decoder_convs(self) -> int:
+        """PURE_JAX: 计算 decoder 中需要 cache 的卷积数量"""
+        count = 1  # conv_in
+        count += 4  # mid_block: 2 resnets * 2 convs each
+        
+        dim_mult = list(self.config.dim_mult)
+        num_res_blocks = self.config.num_res_blocks
+        temperal_upsample = list(reversed(self.config.temperal_downsample))
+        
+        for i in range(len(dim_mult)):
+            count += (num_res_blocks + 1) * 2  # resnets
+            up_flag = i != len(dim_mult) - 1
+            if up_flag and temperal_upsample[i]:
+                count += 1  # time_conv in upsample3d
+        
+        count += 1  # conv_out
+        return count
+
+    def _decode(self, z: jnp.ndarray) -> jnp.ndarray:
+        """
+        PURE_JAX: 原 _decode 方法
+        
+        改动：
+        - self.clear_cache() → 创建新的 cache list
+        - self.post_quant_conv(z) → conv3d(self.params['post_quant_conv'], z)
+        - self.decoder(..., feat_cache=self._feat_map) → decoder_forward(..., feat_cache=cache)
+        """
+        B, T, H, W, C = z.shape
+
+        # PURE_JAX: 原 self.clear_cache() → 创建新 cache
+        num_convs = self._count_decoder_convs()
+        cache = [None] * num_convs
+
+        # PURE_JAX: self.post_quant_conv(z) → conv3d
+        x = conv3d(self.params['post_quant_conv'], z, padding="SAME")
+        
+        out = None
+        for i in range(T):
+            if i == 0:
+                # PURE_JAX: self.decoder(...) → decoder_forward(self.params['decoder'], ...)
+                out, _, cache = decoder_forward(
+                    self.params['decoder'],
+                    x[:, i : i + 1, :, :, :],
+                    self.config,
+                    feat_cache=cache,
+                    first_chunk=True,
+                )
+            else:
+                out_, _, cache = decoder_forward(
+                    self.params['decoder'],
+                    x[:, i : i + 1, :, :, :],
+                    self.config,
+                    feat_cache=cache,
+                    first_chunk=False,
+                )
+                out = jnp.concatenate([out, out_], axis=1)
+
+        if self.config.patch_size is not None:
+            out = unpatchify(out, patch_size=self.config.patch_size)
+
+        out = jnp.clip(out, -1.0, 1.0)
+        return out
+
+    def decode(self, z: jnp.ndarray) -> jnp.ndarray:
+        """PURE_JAX: 原 decode 方法，基本不变"""
+        # 注意：use_slicing 逻辑可按需保留
+        return self._decode(z)
+
     @classmethod
     def from_pretrained(
         cls,
@@ -1448,11 +827,163 @@ class AutoencoderKLWan:
         subfolder: Optional[str] = "vae",
         dtype: jnp.dtype = jnp.float32,
         **kwargs,
-    ) -> "AutoencoderKLWan":
-        """Load pretrained model."""
-        params, config = load_vae_params(
+    ):
+        """
+        PURE_JAX: 原 from_pretrained 方法
+        
+        主要改动：
+        1. 不再创建 nnx 模块，直接构建 params 字典
+        2. 权重转换逻辑保留，但输出格式改变
+        3. 无需 nnx.split/nnx.merge
+        """
+        from huggingface_hub import hf_hub_download
+        from safetensors import safe_open
+        import json
+        import re
+        from collections import defaultdict
+
+        # 1. Config
+        config_path = hf_hub_download(
             pretrained_model_name_or_path,
             subfolder=subfolder,
-            dtype=dtype,
+            filename="config.json"
         )
+        with open(config_path, 'r') as f:
+            config_dict = json.load(f)
+        config_dict.update(kwargs)
+        config = cls.config_class.from_dict(config_dict)
+
+        # 2. Weights
+        ckpt_path = hf_hub_download(
+            pretrained_model_name_or_path,
+            subfolder=subfolder,
+            filename="diffusion_pytorch_model.safetensors"
+        )
+
+        pytorch_weights = {}
+        with safe_open(ckpt_path, framework="np") as f:
+            for k in f.keys():
+                pytorch_weights[k] = f.get_tensor(k)
+
+        # 3. Convert weights (PyTorch -> JAX)
+        # PURE_JAX: 构建嵌套字典而非 nnx 模块
+        def make_nested_dict():
+            return defaultdict(make_nested_dict)
+        
+        params = make_nested_dict()
+
+        def rename_key(key):
+            """
+            PURE_JAX: 键名转换
+            
+            与 Flax NNX 版本的区别：
+            - conv_in.weight → conv_in.kernel (不是 conv_in.conv.kernel)
+            - 因为我们直接用 conv3d 函数，不包装在 WanCausalConv3d 类中
+            """
+            # CausalConv3d: 原版有 .conv. 中间层，纯 JAX 版去掉
+            # PURE_JAX: conv_in.conv.kernel → conv_in.kernel
+            key = key.replace("conv_in.bias", "conv_in.bias")
+            key = key.replace("conv_in.weight", "conv_in.kernel")
+            key = key.replace("conv_out.bias", "conv_out.bias")
+            key = key.replace("conv_out.weight", "conv_out.kernel")
+
+            key = re.sub(r"conv(\d+)\.weight", r"conv\1.kernel", key)
+            key = re.sub(r"conv(\d+)\.bias", r"conv\1.bias", key)
+
+            key = key.replace("time_conv.weight", "time_conv.kernel")
+            key = key.replace("time_conv.bias", "time_conv.bias")
+
+            key = key.replace("quant_conv.weight", "quant_conv.kernel")
+            key = key.replace("quant_conv.bias", "quant_conv.bias")
+            key = key.replace("post_quant_conv.weight", "post_quant_conv.kernel")
+            key = key.replace("post_quant_conv.bias", "post_quant_conv.bias")
+
+            key = key.replace("conv_shortcut.weight", "conv_shortcut.kernel")
+            key = key.replace("conv_shortcut.bias", "conv_shortcut.bias")
+
+            # Resample layers: resample.1 是 resample_conv
+            key = key.replace("resample.1.weight", "resample_conv.kernel")
+            key = key.replace("resample.1.bias", "resample_conv.bias")
+
+            # Attention
+            key = key.replace("to_qkv.weight", "to_qkv.kernel")
+            key = key.replace("to_qkv.bias", "to_qkv.bias")
+            key = key.replace("proj.weight", "proj.kernel")
+            key = key.replace("proj.bias", "proj.bias")
+
+            # Norm: weight -> gamma
+            key = key.replace(".weight", ".gamma")
+
+            return key
+
+        def set_nested(d, keys, value):
+            for key in keys[:-1]:
+                d = d[key]
+            d[keys[-1]] = value
+
+        def convert_key_to_path(key: str) -> List:
+            """将点分隔的键转换为路径列表"""
+            # 处理数字索引
+            key = re.sub(r'\.(\d+)\.', r'[\1].', key)
+            key = re.sub(r'\.(\d+)$', r'[\1]', key)
+            
+            parts = []
+            current = ""
+            for char in key:
+                if char == '.':
+                    if current:
+                        parts.append(current)
+                        current = ""
+                elif char == '[':
+                    if current:
+                        parts.append(current)
+                        current = ""
+                    current = "["
+                elif char == ']':
+                    current += char
+                    parts.append(current)
+                    current = ""
+                else:
+                    current += char
+            if current:
+                parts.append(current)
+            
+            result = []
+            for part in parts:
+                if part.startswith('[') and part.endswith(']'):
+                    result.append(int(part[1:-1]))
+                else:
+                    result.append(part)
+            
+            return result
+
+        for pt_key, pt_tensor in pytorch_weights.items():
+            jax_key = rename_key(pt_key)
+
+            # Convert tensor shape
+            if "kernel" in jax_key:
+                if pt_tensor.ndim == 5:
+                    # Conv3d: (Out, In, T, H, W) -> (T, H, W, In, Out)
+                    pt_tensor = pt_tensor.transpose(2, 3, 4, 1, 0)
+                elif pt_tensor.ndim == 4:
+                    # Conv2d: (Out, In, H, W) -> (H, W, In, Out)
+                    pt_tensor = pt_tensor.transpose(2, 3, 1, 0)
+
+            if "gamma" in jax_key:
+                pt_tensor = pt_tensor.squeeze()
+
+            tensor = jnp.array(pt_tensor, dtype=dtype)
+            
+            keys = convert_key_to_path(jax_key)
+            set_nested(params, keys, tensor)
+
+        # Convert defaultdict to regular dict
+        def to_regular_dict(d):
+            if isinstance(d, defaultdict):
+                d = {k: to_regular_dict(v) for k, v in d.items()}
+            return d
+
+        params = to_regular_dict(params)
+
+        # PURE_JAX: 直接返回实例，无需 nnx.merge
         return cls(params, config)
