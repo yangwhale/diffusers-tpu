@@ -21,7 +21,8 @@ from transformers import AutoTokenizer, UMT5EncoderModel
 
 from ...callbacks import MultiPipelineCallbacks, PipelineCallback
 from ...loaders import WanLoraLoaderMixin
-from ...models import AutoencoderKLWan, WanTransformer3DModel
+from ...models.autoencoders.autoencoder_kl_wan_torchax import AutoencoderKLWan
+from ...models.transformers.transformer_wan_torchax import WanTransformer3DModel
 from ...schedulers import FlowMatchEulerDiscreteScheduler
 from ...utils import is_ftfy_available, is_torch_xla_available, logging, replace_example_docstring
 from ...utils.torch_utils import randn_tensor
@@ -41,87 +42,6 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 if is_ftfy_available():
     import ftfy
-
-# ===================== TPU/JAX specific imports =====================
-import jax
-import jax.numpy as jnp
-from jax.sharding import NamedSharding, PartitionSpec as P
-import torchax
-
-
-def safe_torch_to_jax(x, env):
-    """Convert torch tensor to JAX array safely."""
-    # torch_xla XLATensor
-    if 'xla' in str(type(x)).lower():
-        return env.t2j_iso(x)
-    # Regular torch.Tensor
-    elif isinstance(x, torch.Tensor):
-        return jax.device_put(x.detach().cpu().to(torch.float32).numpy())
-    # Recursive structures
-    elif isinstance(x, (list, tuple)):
-        return type(x)(safe_torch_to_jax(xx, env) for xx in x)
-    elif isinstance(x, dict):
-        return {k: safe_torch_to_jax(v, env) for k, v in x.items()}
-    else:
-        return x
-
-
-def apply_input_sharding(tensor, env, use_dp=False):
-    """Apply sharding to input tensors based on mesh configuration.
-    
-    This is crucial for performance - without proper sharding, JAX needs to
-    resharding data at every step which causes significant overhead.
-    """
-    mesh = getattr(env, '_mesh', None) or getattr(env.param, 'mesh', None)
-    if mesh is None:
-        return tensor
-    
-    # Determine sharding based on tensor shape and use_dp
-    if hasattr(tensor, 'ndim'):
-        ndim = tensor.ndim if not hasattr(tensor, '_elem') else tensor._elem.ndim
-    else:
-        return tensor
-    
-    # For latents and similar 5D tensors (batch, channels, frames, height, width)
-    # Shard on batch dimension if using data parallel
-    if ndim == 5:
-        if use_dp and 'dp' in mesh.axis_names:
-            pspec = P('dp', None, None, None, None)
-        else:
-            pspec = P(None, None, None, None, None)  # replicated
-    # For 3D tensors like prompt embeds (batch, seq, hidden)
-    elif ndim == 3:
-        if use_dp and 'dp' in mesh.axis_names:
-            pspec = P('dp', None, None)
-        else:
-            pspec = P(None, None, None)  # replicated
-    # For 2D tensors like timesteps (batch, seq) or (batch,)
-    elif ndim == 2:
-        if use_dp and 'dp' in mesh.axis_names:
-            pspec = P('dp', None)
-        else:
-            pspec = P(None, None)  # replicated
-    elif ndim == 1:
-        if use_dp and 'dp' in mesh.axis_names:
-            pspec = P('dp')
-        else:
-            pspec = P()  # replicated
-    else:
-        pspec = P()  # replicated for scalar
-    
-    sharding = NamedSharding(mesh, pspec)
-    
-    # Apply sharding based on tensor type
-    if hasattr(tensor, 'apply_jax_'):
-        # torchax Tensor - use in-place sharding
-        tensor.apply_jax_(jax.device_put, sharding)
-        return tensor
-    elif isinstance(tensor, jax.Array):
-        # JAX array - use device_put
-        return jax.device_put(tensor, sharding)
-    else:
-        return tensor
-# ====================================================================
 
 
 EXAMPLE_DOC_STRING = """
@@ -592,10 +512,6 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
 
         device = self._execution_device
 
-        # ===================== TPU/JAX specific: get torchax environment =====================
-        env = torchax.default_env()
-        # =====================================================================================
-
         # 2. Define call parameters
         if prompt is not None and isinstance(prompt, str):
             batch_size = 1
@@ -654,11 +570,6 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         else:
             boundary_timestep = None
 
-        # ===================== TPU/JAX specific: validate use_dp =====================
-        if use_dp:
-            assert self.do_classifier_free_guidance, "use_dp requires classifier free guidance"
-        # =============================================================================
-
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -675,72 +586,34 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     current_model = self.transformer_2
                     current_guidance_scale = guidance_scale_2
 
-                # ===================== TPU/JAX specific: data parallel path =====================
-                if use_dp:
-                    latent_model_input = torch.cat([latents, latents]).to(transformer_dtype)
-                    if self.config.expand_timesteps:
-                        temp_ts = (mask[0][0][:, ::2, ::2] * t).flatten()
-                        timestep = temp_ts.unsqueeze(0).expand(latents.shape[0] * 2, -1)
-                    else:
-                        timestep = t.expand(latents.shape[0] * 2)
-                    encoder_hidden_state = torch.cat([prompt_embeds, negative_prompt_embeds])
+                latent_model_input = latents.to(transformer_dtype)
+                if self.config.expand_timesteps:
+                    # seq_len: num_latent_frames * latent_height//2 * latent_width//2
+                    temp_ts = (mask[0][0][:, ::2, ::2] * t).flatten()
+                    # batch_size, seq_len
+                    timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
+                else:
+                    timestep = t.expand(latents.shape[0])
 
-                    # Convert to JAX if text_encoder is on CPU or None (pre-computed embeddings)
-                    text_encoder_on_cpu = (
-                        self.text_encoder is None or
-                        str(getattr(self.text_encoder, 'device', 'cpu')) == 'cpu'
-                    )
-                    if text_encoder_on_cpu:
-                        latent_model_input = safe_torch_to_jax(latent_model_input, env)
-                        if isinstance(latent_model_input, jnp.ndarray) or 'ArrayImpl' in str(type(latent_model_input)):
-                            latent_model_input = latent_model_input.astype(jnp.bfloat16)
-                        timestep = safe_torch_to_jax(timestep, env)
-                        encoder_hidden_state = safe_torch_to_jax(encoder_hidden_state, env)
-
-                    # Apply input sharding for performance (avoid resharding overhead)
-                    latent_model_input = apply_input_sharding(latent_model_input, env, use_dp=True)
-                    timestep = apply_input_sharding(timestep, env, use_dp=True)
-                    encoder_hidden_state = apply_input_sharding(encoder_hidden_state, env, use_dp=True)
-
-                    with current_model.cache_context("cond"):
-                        stacked_noise = current_model(
-                            hidden_states=latent_model_input,
-                            timestep=timestep,
-                            encoder_hidden_states=encoder_hidden_state,
-                            attention_kwargs=attention_kwargs,
-                            return_dict=False,
-                        )[0]
-
-                    noise_pred, noise_pred_uncond = stacked_noise.chunk(2)
-                    noise_pred = noise_pred_uncond + current_guidance_scale * (noise_pred - noise_pred_uncond)
-
-                    if 'ArrayImpl' in str(type(noise_pred)):
-                        noise_pred = env.t2j_iso(noise_pred)
-
-                    # Ensure tensors are on JAX device
-                    # Note: torchax 0.0.11+ uses 'jax' instead of 'xla'
-                    jax_device_names = ('jax', 'xla', 'privateuseone')
-                    if not hasattr(latents, 'device') or not any(d in str(latents.device) for d in jax_device_names):
-                        latents = latents.to('jax')
-                    if not hasattr(noise_pred, 'device') or not any(d in str(noise_pred.device) for d in jax_device_names):
-                        noise_pred = noise_pred.to('jax')
-
-                    latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-
-                    if 'ArrayImpl' in str(type(latents)):
-                        latents = env.t2j_iso(latents)
+                # ===================== TPU/JAX specific: batch CFG for DP =====================
+                if use_dp and self.do_classifier_free_guidance:
+                    # Stack cond and uncond for single forward pass (like I2V)
+                    batch_latent_model_input = torch.cat([latent_model_input, latent_model_input])
+                    batch_timestep = torch.cat([timestep, timestep]) if timestep.dim() > 0 else timestep.expand(2)
+                    batch_encoder_hidden_states = torch.cat([prompt_embeds, negative_prompt_embeds])
                     
-                    # Re-apply sharding after scheduler step to maintain performance
-                    latents = apply_input_sharding(latents, env, use_dp=False)
+                    batch_noise = current_model(
+                        hidden_states=batch_latent_model_input,
+                        timestep=batch_timestep,
+                        encoder_hidden_states=batch_encoder_hidden_states,
+                        attention_kwargs=attention_kwargs,
+                        return_dict=False,
+                    )[0]
+                    
+                    noise_pred, noise_uncond = batch_noise.chunk(2)
+                    noise_pred = noise_uncond + current_guidance_scale * (noise_pred - noise_uncond)
                 # ===================== Standard path =====================
                 else:
-                    latent_model_input = latents.to(transformer_dtype)
-                    if self.config.expand_timesteps:
-                        temp_ts = (mask[0][0][:, ::2, ::2] * t).flatten()
-                        timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
-                    else:
-                        timestep = t.expand(latents.shape[0])
-
                     with current_model.cache_context("cond"):
                         noise_pred = current_model(
                             hidden_states=latent_model_input,
@@ -760,9 +633,10 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                                 return_dict=False,
                             )[0]
                         noise_pred = noise_uncond + current_guidance_scale * (noise_pred - noise_uncond)
-
-                    latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
                 # =========================================================
+
+                # compute the previous noisy sample x_t -> x_t-1
+                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
@@ -783,27 +657,18 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
 
         self._current_timestep = None
 
-        # ===================== TPU/JAX specific: disable flash attention in VAE =====================
-        torchax.enable_globally()
-        env = torchax.default_env()
-        env.config.use_tpu_flash_attention = False
-        env.config.shmap_flash_attention = False
-        # ============================================================================================
-
         if not output_type == "latent":
-            # Convert torchax.Tensor to JAX array for VAE decode
-            if hasattr(latents, '_elem'):
-                latents_jax = latents._elem
-            else:
-                latents_jax = env.t2j_iso(latents)
-            
-            # Denormalize latents
-            latents_mean = jnp.array(self.vae.config.latents_mean).reshape(1, self.vae.config.z_dim, 1, 1, 1)
-            latents_std = 1.0 / jnp.array(self.vae.config.latents_std).reshape(1, self.vae.config.z_dim, 1, 1, 1)
-            latents_jax = latents_jax.astype(jnp.bfloat16)
-            latents_jax = latents_jax / latents_std + latents_mean
-            
-            video = self.vae.decode(latents_jax, return_dict=False)[0]
+            latents = latents.to(self.vae.dtype)
+            latents_mean = (
+                torch.tensor(self.vae.config.latents_mean)
+                .view(1, self.vae.config.z_dim, 1, 1, 1)
+                .to(latents.device, latents.dtype)
+            )
+            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
+                latents.device, latents.dtype
+            )
+            latents = latents / latents_std + latents_mean
+            video = self.vae.decode(latents, return_dict=False)[0]
             video = self.video_processor.postprocess_video(video, output_type=output_type)
         else:
             video = latents
